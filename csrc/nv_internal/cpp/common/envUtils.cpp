@@ -325,35 +325,35 @@ uint16_t getEnvNixlPort() {
 
 bool getEnvDisaggBenchmarkGenOnly() { return getBoolEnv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"); }
 
-static int sanitizeBlockSize(std::optional<int32_t> const& val) {
-  // Default 256 when not set or invalid
-  int block = val.value_or(256);
+static int sanitizeBlockSize(std::optional<int32_t> const& val, int defaultBlockSize = 256) {
+  int block = val.value_or(defaultBlockSize);
   // Clamp to sane CUDA bounds and warp multiples
-  if (block <= 0) block = 256;
+  if (block <= 0) block = defaultBlockSize;
   if (block > 1024) block = 1024;
   // Round to nearest multiple of 32 (warp size)
   block = (block + 31) / 32 * 32;
-  if (block == 0) block = 256;
+  if (block == 0) block = defaultBlockSize;
   return block;
 }
 
 // Treat malformed values as unset so debug block-size knobs never become hard failures.
-static int getSanitizedBlockSizeFromEnv(char const* name) {
+static std::optional<int32_t> getBlockSizeFromEnv(char const* name) {
   try {
-    return sanitizeBlockSize(getIntEnv(name));
+    return getIntEnv(name);
   } catch (std::exception const&) {
     TLLM_LOG_WARNING("Invalid value for %s. Falling back to default block size.", name);
-    return sanitizeBlockSize(std::nullopt);
+    return std::nullopt;
   }
 }
 
-int getEnvMoeA2ADispatchBlockSize() {
-  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
-  return kBlock;
+int getEnvMoeA2ADispatchBlockSize(int defaultBlockSize) {
+  static auto const kBlockOverride = getBlockSizeFromEnv("TLLM_MOE_A2A_DISPATCH_BLOCK_SIZE");
+  return sanitizeBlockSize(kBlockOverride, defaultBlockSize);
 }
 
 int getEnvMoeA2ACombineBlockSize() {
-  static int const kBlock = getSanitizedBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE");
+  static int const kBlock =
+      sanitizeBlockSize(getBlockSizeFromEnv("TLLM_MOE_A2A_COMBINE_BLOCK_SIZE"));
   return kBlock;
 }
 

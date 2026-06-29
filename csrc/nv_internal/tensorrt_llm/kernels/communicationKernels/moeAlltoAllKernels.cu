@@ -439,12 +439,16 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 
   // Prepare kernel pointers struct
   DispatchKernelPointers kernel_ptrs = {};
+  int max_payload_bytes_per_token = 0;
 
   // Fill source data pointers and payload sizes
   for (int i = 0; i < params.num_payloads; i++) {
     kernel_ptrs.src_data_ptrs[i] = params.payloads[i].src_data;
     kernel_ptrs.payload_bytes_per_token[i] =
         params.payloads[i].element_size * params.payloads[i].elements_per_token;
+    if (kernel_ptrs.payload_bytes_per_token[i] > max_payload_bytes_per_token) {
+      max_payload_bytes_per_token = kernel_ptrs.payload_bytes_per_token[i];
+    }
   }
 
   // Fill receive buffer pointers
@@ -467,7 +471,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
-  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+  // Small CTAs avoid idle threads once there are enough small-payload tokens to saturate the GPU.
+  // Keep the larger CTA for low-token or wider-payload dispatches.
+  int const default_block_size =
+      params.local_num_tokens > 1024 && max_payload_bytes_per_token <= 1024 ? 64 : 256;
+  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize(default_block_size);
 
   // Configure kernel launch: one block per token
   int grid_size = params.local_num_tokens;
