@@ -496,222 +496,61 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
   }
 }
 
-// Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE, int TOP_K, typename T>
+// Accumulate across the compact per-token route list, then store once per segment.
+template <int VEC_SIZE, typename T>
 __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, int rank_id,
-                                        int max_tokens_per_rank,
-                                        CombineKernelPointers const& ptrs) {
+                                        int max_tokens_per_rank, CombineKernelPointers const& ptrs,
+                                        int2 const* routes, int num_routes) {
   constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
   using flashinfer::vec_t;
 
   uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
 
   int const stride = blockDim.x * VEC_SIZE;
-  int const local_token_idx = blockIdx.x;
 
   for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += stride) {
-    vec_t<uint8_t, VEC_SIZE> acc[TOP_K];
+    vec_t<uint8_t, VEC_SIZE> acc;
+    acc.fill(0);
 
-// Unrolled K accumulation using compact top-k lists
-#pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-      int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-      if (dst_idx < 0) {
-        acc[k].fill(0);
-        continue;
-      }
-
-      uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+#pragma unroll 1
+    for (int route_idx = 0; route_idx < num_routes; ++route_idx) {
+      int2 route = routes[route_idx];
+      uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[route.x][0]);
       size_t base_source_rank =
           static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
-          static_cast<size_t>(dst_idx);
+          static_cast<size_t>(route.y);
       size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
 
-      // Load directly into the per-k accumulator; reduce across k below
-      acc[k].load(recv_buffer + base_token + offset);
+      vec_t<uint8_t, VEC_SIZE> value;
+      value.load(recv_buffer + base_token + offset);
+      accumulate_vec<T, elems_per_vec>(reinterpret_cast<T*>(&acc),
+                                       reinterpret_cast<T const*>(&value));
     }
 
-    // Reduce acc[TOP_K] into acc[0]
-    if constexpr (TOP_K == 22) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      T* a10 = reinterpret_cast<T*>(&acc[10]);
-      T* a11 = reinterpret_cast<T*>(&acc[11]);
-      T* a12 = reinterpret_cast<T*>(&acc[12]);
-      T* a13 = reinterpret_cast<T*>(&acc[13]);
-      T* a14 = reinterpret_cast<T*>(&acc[14]);
-      T* a15 = reinterpret_cast<T*>(&acc[15]);
-      T* a16 = reinterpret_cast<T*>(&acc[16]);
-      T* a17 = reinterpret_cast<T*>(&acc[17]);
-      T* a18 = reinterpret_cast<T*>(&acc[18]);
-      T* a19 = reinterpret_cast<T*>(&acc[19]);
-      T* a20 = reinterpret_cast<T*>(&acc[20]);
-      T* a21 = reinterpret_cast<T*>(&acc[21]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-      accumulate_vec<T, elems_per_vec>(a10, a11);
-      accumulate_vec<T, elems_per_vec>(a12, a13);
-      accumulate_vec<T, elems_per_vec>(a14, a15);
-      accumulate_vec<T, elems_per_vec>(a16, a17);
-      accumulate_vec<T, elems_per_vec>(a18, a19);
-      accumulate_vec<T, elems_per_vec>(a20, a21);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a8, a10);
-      accumulate_vec<T, elems_per_vec>(a12, a14);
-      accumulate_vec<T, elems_per_vec>(a16, a18);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a8, a12);
-      accumulate_vec<T, elems_per_vec>(a16, a20);
-
-      accumulate_vec<T, elems_per_vec>(a0, a8);
-      accumulate_vec<T, elems_per_vec>(a0, a16);
-    } else if constexpr (TOP_K == 16) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      T* a10 = reinterpret_cast<T*>(&acc[10]);
-      T* a11 = reinterpret_cast<T*>(&acc[11]);
-      T* a12 = reinterpret_cast<T*>(&acc[12]);
-      T* a13 = reinterpret_cast<T*>(&acc[13]);
-      T* a14 = reinterpret_cast<T*>(&acc[14]);
-      T* a15 = reinterpret_cast<T*>(&acc[15]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-      accumulate_vec<T, elems_per_vec>(a10, a11);
-      accumulate_vec<T, elems_per_vec>(a12, a13);
-      accumulate_vec<T, elems_per_vec>(a14, a15);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a8, a10);
-      accumulate_vec<T, elems_per_vec>(a12, a14);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a8, a12);
-
-      accumulate_vec<T, elems_per_vec>(a0, a8);
-    } else if constexpr (TOP_K == 10) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      T* a8 = reinterpret_cast<T*>(&acc[8]);
-      T* a9 = reinterpret_cast<T*>(&acc[9]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a8, a9);
-
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-      accumulate_vec<T, elems_per_vec>(a0, a8);
-    } else if constexpr (TOP_K == 8) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      T* a6 = reinterpret_cast<T*>(&acc[6]);
-      T* a7 = reinterpret_cast<T*>(&acc[7]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a6, a7);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a4, a6);
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-    } else if constexpr (TOP_K == 6) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      T* a4 = reinterpret_cast<T*>(&acc[4]);
-      T* a5 = reinterpret_cast<T*>(&acc[5]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a4, a5);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-      accumulate_vec<T, elems_per_vec>(a0, a4);
-    } else if constexpr (TOP_K == 4) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      T* a2 = reinterpret_cast<T*>(&acc[2]);
-      T* a3 = reinterpret_cast<T*>(&acc[3]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-      accumulate_vec<T, elems_per_vec>(a2, a3);
-      accumulate_vec<T, elems_per_vec>(a0, a2);
-    } else if constexpr (TOP_K == 2) {
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-      T* a1 = reinterpret_cast<T*>(&acc[1]);
-      accumulate_vec<T, elems_per_vec>(a0, a1);
-    } else if constexpr (TOP_K == 1) {
-      // nothing to do
-    } else {
-      // Fallback for any future unspecialized TOP_K instantiations.
-      T* a0 = reinterpret_cast<T*>(&acc[0]);
-#pragma unroll
-      for (int k = 1; k < TOP_K; ++k) {
-        T* ak = reinterpret_cast<T*>(&acc[k]);
-        accumulate_vec<T, elems_per_vec>(a0, ak);
-      }
-    }
-
-    acc[0].store(dst_bytes + offset);
+    acc.store(dst_bytes + offset);
   }
 }
 
 // Wrapper that selects vector width based on size_per_token alignment
-template <int TOP_K, typename T>
+template <typename T>
 __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int rank_id,
-                                   int max_tokens_per_rank, CombineKernelPointers const& ptrs) {
+                                   int max_tokens_per_rank, CombineKernelPointers const& ptrs,
+                                   int2 const* routes, int num_routes) {
   if (size_per_token % 16 == 0) {
-    vectorized_combine_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                          max_tokens_per_rank, ptrs);
+    vectorized_combine_impl<16, T>(dst_typed_base, size_per_token, rank_id, max_tokens_per_rank,
+                                   ptrs, routes, num_routes);
   } else if (size_per_token % 8 == 0) {
-    vectorized_combine_impl<8, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+    vectorized_combine_impl<8, T>(dst_typed_base, size_per_token, rank_id, max_tokens_per_rank,
+                                  ptrs, routes, num_routes);
   } else if (size_per_token % 4 == 0) {
-    vectorized_combine_impl<4, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+    vectorized_combine_impl<4, T>(dst_typed_base, size_per_token, rank_id, max_tokens_per_rank,
+                                  ptrs, routes, num_routes);
   } else if (size_per_token % 2 == 0) {
-    vectorized_combine_impl<2, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+    vectorized_combine_impl<2, T>(dst_typed_base, size_per_token, rank_id, max_tokens_per_rank,
+                                  ptrs, routes, num_routes);
   } else {
-    vectorized_combine_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                         max_tokens_per_rank, ptrs);
+    vectorized_combine_impl<1, T>(dst_typed_base, size_per_token, rank_id, max_tokens_per_rank,
+                                  ptrs, routes, num_routes);
   }
 }
 
@@ -829,11 +668,36 @@ __global__ void moeA2ACombineKernel(
 
   if (local_num_tokens == 0) return;
 
+  // Dispatch stores one valid route per destination rank and marks duplicate ranks with -1.
+  // Compact those sparse top-k entries once per block instead of reloading all of them in every
+  // thread that owns an output segment.
+  __shared__ int2 routes[TOP_K];
+  __shared__ int num_routes;
+  if (threadIdx.x < warpSize) {
+    int route_rank = -1;
+    int route_slot = -1;
+    if (threadIdx.x < TOP_K) {
+      int route_offset = local_token_idx * TOP_K + threadIdx.x;
+      route_rank = ptrs.topk_target_ranks[route_offset];
+      route_slot = ptrs.topk_send_indices[route_offset];
+    }
+
+    unsigned int valid_routes = __ballot_sync(0xffffffff, route_slot >= 0);
+    if (route_slot >= 0) {
+      int compact_idx = __popc(valid_routes & __lanemask_lt());
+      routes[compact_idx] = make_int2(route_rank, route_slot);
+    }
+    if (threadIdx.x == 0) {
+      num_routes = __popc(valid_routes);
+    }
+  }
+  __syncthreads();
+
   // Get output location for this token (using src_data_ptrs[0] as output)
   T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
-  // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+  vectorized_combine<T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs, routes,
+                        num_routes);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
