@@ -187,6 +187,9 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
                                          int const* topk_send_indices) {
   using flashinfer::vec_t;
 
+  // Avoid constructing destination pointers for threads with no payload data to copy.
+  if (threadIdx.x * VEC_SIZE >= bytes_per_token) return;
+
   // Precompute destination base pointers per k
   uint8_t* dst_base_k[TOP_K];
 #pragma unroll
