@@ -125,7 +125,7 @@ def get_moe_alltoall_module():
             payload_in_workspace: If True, payload is workspace-backed
             output: [local_num_tokens, elements_per_token] destination tensor
         """
-        module.moe_a2a_combine(
+        module.moe_a2a_combine_into(
             payload,
             local_num_tokens,
             workspace,

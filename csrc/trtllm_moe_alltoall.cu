@@ -410,6 +410,6 @@ Tuple<Array<String>, Array<int64_t>> getMoeA2AMetaInfoIndexPairs() {
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_aux_data_size, getMoeA2AAuxDataSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine_into, moeA2ACombineOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_metainfo_index_pairs, getMoeA2AMetaInfoIndexPairs);
