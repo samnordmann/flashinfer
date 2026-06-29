@@ -684,7 +684,8 @@ __global__ void moeA2ACombineKernel(
 
     unsigned int valid_routes = __ballot_sync(0xffffffff, route_slot >= 0);
     if (route_slot >= 0) {
-      int compact_idx = __popc(valid_routes & __lanemask_lt());
+      unsigned int lower_lanes = (1u << threadIdx.x) - 1u;
+      int compact_idx = __popc(valid_routes & lower_lanes);
       routes[compact_idx] = make_int2(route_rank, route_slot);
     }
     if (threadIdx.x == 0) {
