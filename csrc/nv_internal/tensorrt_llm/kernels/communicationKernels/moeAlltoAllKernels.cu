@@ -609,6 +609,31 @@ __global__ void moeA2ACombineKernel(
     if (local_token_idx >= local_num_tokens) return;
   }
 
+  // Dispatch stores one valid route per destination rank and marks duplicate ranks with -1.
+  // Compact those sparse top-k entries once per block instead of reloading all of them in every
+  // thread that owns an output segment.
+  __shared__ int2 routes[TOP_K];
+  __shared__ int num_routes;
+  if (local_num_tokens != 0 && threadIdx.x < warpSize) {
+    int route_rank = -1;
+    int route_slot = -1;
+    if (threadIdx.x < TOP_K) {
+      int route_offset = local_token_idx * TOP_K + threadIdx.x;
+      route_rank = ptrs.topk_target_ranks[route_offset];
+      route_slot = ptrs.topk_send_indices[route_offset];
+    }
+
+    unsigned int valid_routes = __ballot_sync(0xffffffff, route_slot >= 0);
+    if (route_slot >= 0) {
+      unsigned int lower_lanes = (1u << threadIdx.x) - 1u;
+      int compact_idx = __popc(valid_routes & lower_lanes);
+      routes[compact_idx] = make_int2(route_rank, route_slot);
+    }
+    if (threadIdx.x == 0) {
+      num_routes = __popc(valid_routes);
+    }
+  }
+
 #if !DISABLE_SYNC_FOR_PROFILING
   // In-kernel readiness synchronization at start of combine:
   // - One warp signals readiness to all peers with current flag_val.
@@ -668,31 +693,9 @@ __global__ void moeA2ACombineKernel(
 
   if (local_num_tokens == 0) return;
 
-  // Dispatch stores one valid route per destination rank and marks duplicate ranks with -1.
-  // Compact those sparse top-k entries once per block instead of reloading all of them in every
-  // thread that owns an output segment.
-  __shared__ int2 routes[TOP_K];
-  __shared__ int num_routes;
-  if (threadIdx.x < warpSize) {
-    int route_rank = -1;
-    int route_slot = -1;
-    if (threadIdx.x < TOP_K) {
-      int route_offset = local_token_idx * TOP_K + threadIdx.x;
-      route_rank = ptrs.topk_target_ranks[route_offset];
-      route_slot = ptrs.topk_send_indices[route_offset];
-    }
-
-    unsigned int valid_routes = __ballot_sync(0xffffffff, route_slot >= 0);
-    if (route_slot >= 0) {
-      unsigned int lower_lanes = (1u << threadIdx.x) - 1u;
-      int compact_idx = __popc(valid_routes & lower_lanes);
-      routes[compact_idx] = make_int2(route_rank, route_slot);
-    }
-    if (threadIdx.x == 0) {
-      num_routes = __popc(valid_routes);
-    }
-  }
+#if DISABLE_SYNC_FOR_PROFILING
   __syncthreads();
+#endif
 
   // Get output location for this token (using src_data_ptrs[0] as output)
   T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
