@@ -117,7 +117,7 @@ struct MoeA2ADispatchParams {
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
-// Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
+// Prepare for dispatch: zero counters and reserve adjacent dispatch/combine generations.
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters
@@ -162,6 +162,7 @@ struct MoeA2ACombineParams {
 // Combine kernels
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
+// Stage a caller-owned payload. This is a no-op when compute wrote directly into the workspace.
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
 
 // Sanitize expert IDs for invalid tokens

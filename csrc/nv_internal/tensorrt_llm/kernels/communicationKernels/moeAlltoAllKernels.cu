@@ -255,8 +255,9 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
   // Zero local_token_counter and increment flag_val
   if (idx == 0) {
     *local_token_counter = 0;
-    // Increment flag_val for this dispatch round
-    *flag_val_ptr = *flag_val_ptr + 1;
+    // Reserve adjacent generations for this dispatch and its matching combine.
+    // Keeping the update in a captured kernel makes this CUDA graph replay safe.
+    *flag_val_ptr = *flag_val_ptr + 2;
   }
 }
 
@@ -718,15 +719,7 @@ __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int ra
 // Copy payload to recv buffer using vectorized copy; one block per token
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t const* payload_bytes,
                                            int bytes_per_token, int ep_size,
-                                           int max_tokens_per_rank, uint32_t* flag_val_ptr,
-                                           int const* recv_counters) {
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    // Increment flag_val for this combine round
-    *flag_val_ptr = *flag_val_ptr + 1;
-  }
-
-  if (payload_bytes == nullptr) return;
-
+                                           int max_tokens_per_rank, int const* recv_counters) {
   int slot_idx = blockIdx.x;
 
   int total_slots = ep_size * max_tokens_per_rank;
@@ -777,7 +770,8 @@ __global__ void moeA2ACombineKernel(
   bool is_first_warp = threadIdx.x / warpSize == 0;
   if (is_first_warp) {
     int lane_id = threadIdx.x % warpSize;
-    uint32_t expected_value = *ptrs.flag_val;
+    // Dispatch owns the even generation; its matching combine uses the adjacent odd one.
+    uint32_t expected_value = *ptrs.flag_val + 1;
 
     if (blockIdx.x == 0) {
       // asm volatile("fence.release.sys;");
@@ -837,6 +831,12 @@ __global__ void moeA2ACombineKernel(
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
+  // Expert compute can write directly into the shared receive buffer. In that case there is
+  // nothing to stage, and combine derives its generation from the preceding dispatch.
+  if (params.prepare_payload == nullptr) {
+    return;
+  }
+
   constexpr int kBlockSize = 256;
 
   // Calculate bytes per token based on dtype
@@ -857,13 +857,12 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   }
 
   int bytes_per_token = params.elements_per_token * element_size;
-  int grid_size_block =
-      params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
+  int grid_size_block = params.ep_size * params.max_tokens_per_rank;
 
   moeA2APrepareCombineKernel<<<grid_size_block, kBlockSize, 0, params.stream>>>(
       static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank])),
       static_cast<uint8_t const*>(params.prepare_payload), bytes_per_token, params.ep_size,
-      params.max_tokens_per_rank, params.flag_val, params.recv_counters);
+      params.max_tokens_per_rank, params.recv_counters);
 }
 
 // ============================================================================
