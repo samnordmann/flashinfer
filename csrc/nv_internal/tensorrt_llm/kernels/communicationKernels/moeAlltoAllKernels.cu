@@ -757,30 +757,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
 // Wrapper that selects vector width based on size_per_token alignment
 template <int TOP_K, typename T>
 __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int rank_id,
-                                   int max_tokens_per_rank, int ep_size,
-                                   CombineKernelPointers const& ptrs) {
-  if constexpr (TOP_K == 22) {
-    if (ep_size == 4) {
-      if (size_per_token % 16 == 0) {
-        vectorized_combine_ep4_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                                  max_tokens_per_rank, ptrs);
-      } else if (size_per_token % 8 == 0) {
-        vectorized_combine_ep4_impl<8, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                                 max_tokens_per_rank, ptrs);
-      } else if (size_per_token % 4 == 0) {
-        vectorized_combine_ep4_impl<4, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                                 max_tokens_per_rank, ptrs);
-      } else if (size_per_token % 2 == 0) {
-        vectorized_combine_ep4_impl<2, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                                 max_tokens_per_rank, ptrs);
-      } else {
-        vectorized_combine_ep4_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
-                                                 max_tokens_per_rank, ptrs);
-      }
-      return;
-    }
-  }
-
+                                   int max_tokens_per_rank, CombineKernelPointers const& ptrs) {
   if (size_per_token % 16 == 0) {
     vectorized_combine_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
                                           max_tokens_per_rank, ptrs);
@@ -796,6 +773,27 @@ __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int ra
   } else {
     vectorized_combine_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
                                          max_tokens_per_rank, ptrs);
+  }
+}
+
+template <int TOP_K, typename T>
+__device__ void vectorized_combine_ep4(T* dst_typed_base, int size_per_token, int rank_id,
+                                       int max_tokens_per_rank, CombineKernelPointers const& ptrs) {
+  if (size_per_token % 16 == 0) {
+    vectorized_combine_ep4_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                              max_tokens_per_rank, ptrs);
+  } else if (size_per_token % 8 == 0) {
+    vectorized_combine_ep4_impl<8, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                             max_tokens_per_rank, ptrs);
+  } else if (size_per_token % 4 == 0) {
+    vectorized_combine_ep4_impl<4, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                             max_tokens_per_rank, ptrs);
+  } else if (size_per_token % 2 == 0) {
+    vectorized_combine_ep4_impl<2, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                             max_tokens_per_rank, ptrs);
+  } else {
+    vectorized_combine_ep4_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                             max_tokens_per_rank, ptrs);
   }
 }
 
@@ -836,7 +834,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, int TOP_K>
+template <typename T, int TOP_K, bool COMPACT_EP4 = false>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id,
@@ -916,9 +914,15 @@ __global__ void moeA2ACombineKernel(
   // Get output location for this token (using src_data_ptrs[0] as output)
   T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
-  // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ep_size,
-                               ptrs);
+  // Keep the compact EP=4 path in a separate kernel instantiation so its register allocation is
+  // independent of the generic TOP_K-vector fallback.
+  if constexpr (COMPACT_EP4) {
+    static_assert(TOP_K == 22);
+    vectorized_combine_ep4<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank,
+                                     ptrs);
+  } else {
+    vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+  }
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -995,9 +999,23 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Launch appropriate kernel with compact macros
   SWITCH_DTYPE(params.dtype, TKernelType, {
     SWITCH_TOP_K(params.top_k, TOP_K, {
-      moeA2ACombineKernel<TKernelType, TOP_K><<<grid_size_block, kBlockSize, 0, params.stream>>>(
-          kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-          params.local_num_tokens, params.ep_rank, params.ep_size);
+      if constexpr (TOP_K == 22) {
+        if (params.ep_size == 4) {
+          moeA2ACombineKernel<TKernelType, TOP_K, true>
+              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
+                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                  params.local_num_tokens, params.ep_rank, params.ep_size);
+        } else {
+          moeA2ACombineKernel<TKernelType, TOP_K>
+              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
+                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                  params.local_num_tokens, params.ep_rank, params.ep_size);
+        }
+      } else {
+        moeA2ACombineKernel<TKernelType, TOP_K><<<grid_size_block, kBlockSize, 0, params.stream>>>(
+            kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+            params.local_num_tokens, params.ep_rank, params.ep_size);
+      }
     });
   });
 }
