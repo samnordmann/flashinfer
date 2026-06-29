@@ -130,7 +130,8 @@ __host__ __device__ inline T ceilDiv(T m, T n) {
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
 
-__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank) {
+template <bool EXPERTS_PER_RANK_IS_POWER_OF_TWO>
+__device__ __forceinline__ int compute_target_rank_id(int expert_id, int expert_rank_mapping_arg) {
   // Compute which rank owns a given expert using contiguous partitioning
   // Experts are divided evenly across EP ranks:
   // - Rank 0 gets experts [0, num_experts_per_rank)
@@ -141,7 +142,11 @@ __device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank) {
   // - Rank 1: experts 8-15
   // - Rank 2: experts 16-23
   // - Rank 3: experts 24-31
-  return expert_id / num_experts_per_rank;
+  if constexpr (EXPERTS_PER_RANK_IS_POWER_OF_TWO) {
+    return expert_id >> expert_rank_mapping_arg;
+  } else {
+    return expert_id / expert_rank_mapping_arg;
+  }
 }
 
 // ============================================================================
@@ -268,13 +273,13 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
-template <int TOP_K>
+template <int TOP_K, bool EXPERTS_PER_RANK_IS_POWER_OF_TWO>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+    int local_num_tokens, int rank_id, int ep_size, int expert_rank_mapping_arg) {
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -296,7 +301,8 @@ __global__ void moeA2ADispatchKernel(
     for (int k = 0; k < TOP_K; k++) {
       int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
       // Use contiguous partitioning to determine target rank
-      int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+      int target_rank = compute_target_rank_id<EXPERTS_PER_RANK_IS_POWER_OF_TWO>(
+          expert_id, expert_rank_mapping_arg);
 
       if (already_copied & (1ULL << target_rank)) {
         if (thread_idx == 0) {
@@ -434,6 +440,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   // Validate parameters
   TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
   TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+  TLLM_CHECK(params.num_experts_per_rank > 0);
   TLLM_CHECK(params.local_num_tokens >= 0);
   TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
 
@@ -477,11 +484,21 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     grid_size = 1;
   }
   int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-  SWITCH_TOP_K(params.top_k, TOP_K,
-               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                   params.ep_size, params.num_experts_per_rank))
+  bool const experts_per_rank_is_power_of_two =
+      (params.num_experts_per_rank & (params.num_experts_per_rank - 1)) == 0;
+  int const expert_rank_mapping_arg =
+      experts_per_rank_is_power_of_two
+          ? __builtin_ctz(static_cast<unsigned int>(params.num_experts_per_rank))
+          : params.num_experts_per_rank;
+
+  SWITCH_BOOL(experts_per_rank_is_power_of_two, EXPERTS_PER_RANK_IS_POWER_OF_TWO, {
+    SWITCH_TOP_K(params.top_k, TOP_K,
+                 moeA2ADispatchKernel<TOP_K, EXPERTS_PER_RANK_IS_POWER_OF_TWO>
+                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                     params.ep_size, expert_rank_mapping_arg));
+  })
 }
 
 // ============================================================================
