@@ -237,31 +237,29 @@ __device__ void vectorized_copy(void* dst, void const* src, int size) {
   }
 }
 
-// Vectorized dispatch: load one vec from source and write to up to TOP_K destinations
-template <int VEC_SIZE, int TOP_K>
+// Vectorized dispatch: load one vec from source and write it to each unique target rank.
+template <int VEC_SIZE, int MAX_TARGET_RANKS>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                          int max_tokens_per_rank, int payload_idx,
                                          DispatchKernelPointers const& ptrs,
-                                         int const* topk_target_ranks,
-                                         int const* topk_send_indices) {
+                                         int const* target_ranks, int const* send_indices) {
   using flashinfer::vec_t;
 
-  // Precompute destination base pointers per k
-  uint8_t* dst_base_k[TOP_K];
+  uint8_t* dst_bases[MAX_TARGET_RANKS];
 #pragma unroll
-  for (int k = 0; k < TOP_K; ++k) {
-    int dst_idx_k = topk_send_indices[k];
-    int target_rank_k = topk_target_ranks[k];
-    if (dst_idx_k < 0) {
-      dst_base_k[k] = nullptr;
+  for (int i = 0; i < MAX_TARGET_RANKS; ++i) {
+    int dst_idx = send_indices[i];
+    int target_rank = target_ranks[i];
+    if (dst_idx < 0) {
+      dst_bases[i] = nullptr;
       continue;
     }
-    uint8_t* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank_k][payload_idx]);
+    uint8_t* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][payload_idx]);
     size_t base_source_rank =
         static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
-        static_cast<size_t>(dst_idx_k);
+        static_cast<size_t>(dst_idx);
     size_t base_token = base_source_rank * static_cast<size_t>(bytes_per_token);
-    dst_base_k[k] = dst_data + base_token;
+    dst_bases[i] = dst_data + base_token;
   }
 
   // TODO: process all payloads. index could be reused.
@@ -271,8 +269,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
     v.load(src_ptr + offset);
 
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      uint8_t* dst_base = dst_base_k[k];
+    for (int i = 0; i < MAX_TARGET_RANKS; ++i) {
+      uint8_t* dst_base = dst_bases[i];
       if (dst_base == nullptr) {
         continue;
       }
@@ -281,26 +279,31 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 }
 
-template <int TOP_K>
+template <int MAX_TARGET_RANKS>
 __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                     int max_tokens_per_rank, int payload_idx,
-                                    DispatchKernelPointers const& ptrs,
-                                    int const* topk_target_ranks, int const* topk_send_indices) {
+                                    DispatchKernelPointers const& ptrs, int const* target_ranks,
+                                    int const* send_indices) {
   if (bytes_per_token % 16 == 0) {
-    vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<16, MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id,
+                                                   max_tokens_per_rank, payload_idx, ptrs,
+                                                   target_ranks, send_indices);
   } else if (bytes_per_token % 8 == 0) {
-    vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<8, MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id,
+                                                  max_tokens_per_rank, payload_idx, ptrs,
+                                                  target_ranks, send_indices);
   } else if (bytes_per_token % 4 == 0) {
-    vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<4, MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id,
+                                                  max_tokens_per_rank, payload_idx, ptrs,
+                                                  target_ranks, send_indices);
   } else if (bytes_per_token % 2 == 0) {
-    vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<2, MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id,
+                                                  max_tokens_per_rank, payload_idx, ptrs,
+                                                  target_ranks, send_indices);
   } else {
-    vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+    vectorized_dispatch_impl<1, MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id,
+                                                  max_tokens_per_rank, payload_idx, ptrs,
+                                                  target_ranks, send_indices);
   }
 }
 
@@ -327,7 +330,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
-template <int TOP_K>
+template <int TOP_K, int MAX_TARGET_RANKS>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
@@ -348,10 +351,11 @@ __global__ void moeA2ADispatchKernel(
 
     // Prepare per-policy shared-memory tiles for this token
     extern __shared__ int smem[];
-    int* smem_topk_target_ranks = smem;
-    int* smem_topk_send_indices = smem + TOP_K;
+    int* smem_target_ranks = smem;
+    int* smem_send_indices = smem + MAX_TARGET_RANKS;
 
     uint64_t already_copied = 0;
+    int num_target_ranks = 0;
     for (int k = 0; k < TOP_K; k++) {
       int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
       // Use contiguous partitioning to determine target rank
@@ -361,9 +365,6 @@ __global__ void moeA2ADispatchKernel(
         if (thread_idx == 0) {
           ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
           ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-          // Mirror to shared memory immediately
-          smem_topk_target_ranks[k] = -1;
-          smem_topk_send_indices[k] = -1;
         }
         continue;
       }
@@ -375,32 +376,38 @@ __global__ void moeA2ADispatchKernel(
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        // Mirror to shared memory immediately
-        smem_topk_target_ranks[k] = target_rank;
-        smem_topk_send_indices[k] = dst_token_idx;
+        smem_target_ranks[num_target_ranks] = target_rank;
+        smem_send_indices[num_target_ranks] = dst_token_idx;
       }
       already_copied |= 1ULL << target_rank;
+      ++num_target_ranks;
+    }
+    if (thread_idx == 0) {
+      for (int i = num_target_ranks; i < MAX_TARGET_RANKS; ++i) {
+        smem_target_ranks[i] = -1;
+        smem_send_indices[i] = -1;
+      }
     }
     // Sync before dispatching data
     __syncthreads();
 
-    // Read staged routing once into registers per thread
-    int topk_target_ranks[TOP_K];
-    int topk_send_indices[TOP_K];
+    // Read the compact unique-rank routing list once into registers per thread.
+    int target_ranks[MAX_TARGET_RANKS];
+    int send_indices[MAX_TARGET_RANKS];
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      topk_target_ranks[k] = smem_topk_target_ranks[k];
-      topk_send_indices[k] = smem_topk_send_indices[k];
+    for (int i = 0; i < MAX_TARGET_RANKS; ++i) {
+      target_ranks[i] = smem_target_ranks[i];
+      send_indices[i] = smem_send_indices[i];
     }
 
-    // Perform a single source load and TOP_K fanout per payload
+    // Perform a single source load and unique-rank fanout per payload.
     for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
       uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
       int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
       uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                 payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+      vectorized_dispatch<MAX_TARGET_RANKS>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                            payload_idx, ptrs, target_ranks, send_indices);
     }
 
     __syncthreads();
@@ -543,12 +550,26 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   if (grid_size == 0) {
     grid_size = 1;
   }
-  int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-  SWITCH_TOP_K(params.top_k, TOP_K,
-               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                   params.ep_size, params.num_experts_per_rank))
+#define LAUNCH_DISPATCH(TARGET_CAPACITY)                                                         \
+  {                                                                                              \
+    constexpr int SHARED_BYTES = 2 * TARGET_CAPACITY * static_cast<int>(sizeof(int));            \
+    moeA2ADispatchKernel<TOP_K, TARGET_CAPACITY>                                                 \
+        <<<grid_size, kBlockSize, SHARED_BYTES, params.stream>>>(                                \
+            params.token_selected_experts, kernel_ptrs, params.num_payloads,                     \
+            params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, \
+            params.num_experts_per_rank);                                                        \
+  }
+
+  SWITCH_TOP_K(params.top_k, TOP_K, {
+    if (params.ep_size == 4) {
+      constexpr int TARGET_CAPACITY = TOP_K < 4 ? TOP_K : 4;
+      LAUNCH_DISPATCH(TARGET_CAPACITY);
+    } else {
+      LAUNCH_DISPATCH(TOP_K);
+    }
+  })
+
+#undef LAUNCH_DISPATCH
 }
 
 // ============================================================================
