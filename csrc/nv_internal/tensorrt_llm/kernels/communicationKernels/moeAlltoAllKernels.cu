@@ -496,6 +496,67 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
   }
 }
 
+// Dispatch records at most one entry per destination rank. Keep only those four entries live for
+// the EP=4 Nemotron Ultra configuration instead of materializing TOP_K vectors, most of which are
+// zero after rank deduplication.
+template <int VEC_SIZE, int TOP_K, typename T>
+__device__ void vectorized_combine_ep4_impl(T* dst_typed_base, int size_per_token, int rank_id,
+                                            int max_tokens_per_rank,
+                                            CombineKernelPointers const& ptrs) {
+  constexpr int elems_per_vec = VEC_SIZE / sizeof(T);
+  using flashinfer::vec_t;
+
+  uint8_t* dst_bytes = reinterpret_cast<uint8_t*>(dst_typed_base);
+  int const stride = blockDim.x * VEC_SIZE;
+  int const local_token_idx = blockIdx.x;
+
+  for (int offset = threadIdx.x * VEC_SIZE; offset < size_per_token; offset += stride) {
+    vec_t<uint8_t, VEC_SIZE> acc0;
+    vec_t<uint8_t, VEC_SIZE> acc1;
+    vec_t<uint8_t, VEC_SIZE> acc2;
+    vec_t<uint8_t, VEC_SIZE> acc3;
+    acc0.fill(0);
+    acc1.fill(0);
+    acc2.fill(0);
+    acc3.fill(0);
+
+    int num_valid = 0;
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+      int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
+      int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
+      if (dst_idx < 0) continue;
+
+      uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+      size_t base_source_rank =
+          static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
+          static_cast<size_t>(dst_idx);
+      size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
+
+      uint8_t const* src = recv_buffer + base_token + offset;
+      if (num_valid == 0) {
+        acc0.load(src);
+      } else if (num_valid == 1) {
+        acc1.load(src);
+      } else if (num_valid == 2) {
+        acc2.load(src);
+      } else {
+        acc3.load(src);
+      }
+      ++num_valid;
+    }
+
+    T* a0 = reinterpret_cast<T*>(&acc0);
+    T* a1 = reinterpret_cast<T*>(&acc1);
+    T* a2 = reinterpret_cast<T*>(&acc2);
+    T* a3 = reinterpret_cast<T*>(&acc3);
+    accumulate_vec<T, elems_per_vec>(a0, a1);
+    accumulate_vec<T, elems_per_vec>(a2, a3);
+    accumulate_vec<T, elems_per_vec>(a0, a2);
+    acc0.store(dst_bytes + offset);
+  }
+}
+
 // Accumulate across all valid ranks into registers, then store once per segment
 template <int VEC_SIZE, int TOP_K, typename T>
 __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, int rank_id,
@@ -696,7 +757,30 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
 // Wrapper that selects vector width based on size_per_token alignment
 template <int TOP_K, typename T>
 __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int rank_id,
-                                   int max_tokens_per_rank, CombineKernelPointers const& ptrs) {
+                                   int max_tokens_per_rank, int ep_size,
+                                   CombineKernelPointers const& ptrs) {
+  if constexpr (TOP_K == 22) {
+    if (ep_size == 4) {
+      if (size_per_token % 16 == 0) {
+        vectorized_combine_ep4_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                                  max_tokens_per_rank, ptrs);
+      } else if (size_per_token % 8 == 0) {
+        vectorized_combine_ep4_impl<8, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                                 max_tokens_per_rank, ptrs);
+      } else if (size_per_token % 4 == 0) {
+        vectorized_combine_ep4_impl<4, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                                 max_tokens_per_rank, ptrs);
+      } else if (size_per_token % 2 == 0) {
+        vectorized_combine_ep4_impl<2, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                                 max_tokens_per_rank, ptrs);
+      } else {
+        vectorized_combine_ep4_impl<1, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
+                                                 max_tokens_per_rank, ptrs);
+      }
+      return;
+    }
+  }
+
   if (size_per_token % 16 == 0) {
     vectorized_combine_impl<16, TOP_K, T>(dst_typed_base, size_per_token, rank_id,
                                           max_tokens_per_rank, ptrs);
@@ -833,7 +917,8 @@ __global__ void moeA2ACombineKernel(
   T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
 
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
+  vectorized_combine<TOP_K, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ep_size,
+                               ptrs);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
