@@ -95,8 +95,9 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 // TODO: For DEV purpose temporarily.
-// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
-int getEnvMoeA2ADispatchBlockSize();
+// Block size (threads per block) for MoE A2A Dispatch kernels.
+// defaultBlockSize is used when the environment override is unset or invalid.
+int getEnvMoeA2ADispatchBlockSize(int defaultBlockSize = 256);
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
 
