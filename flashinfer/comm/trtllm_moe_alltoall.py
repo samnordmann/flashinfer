@@ -94,7 +94,7 @@ def get_moe_alltoall_module():
 
     @register_custom_op(
         "flashinfer::moe_a2a_combine",
-        mutates_args=("workspace",),
+        mutates_args=("workspace", "output"),
     )
     def moe_a2a_combine(
         payload: torch.Tensor,
@@ -106,8 +106,9 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         combine_payload_offset: int,
-        payload_in_workspace: bool = False,
-    ) -> torch.Tensor:
+        payload_in_workspace: bool,
+        output: torch.Tensor,
+    ) -> None:
         """
         Combine expert outputs back to originating tokens.
 
@@ -122,11 +123,9 @@ def get_moe_alltoall_module():
             top_k: Number of experts per token
             combine_payload_offset: Offset from dispatch
             payload_in_workspace: If True, payload is workspace-backed
-
-        Returns:
-            output: [local_num_tokens, elements_per_token] tensor
+            output: [local_num_tokens, elements_per_token] destination tensor
         """
-        return module.moe_a2a_combine(
+        module.moe_a2a_combine(
             payload,
             local_num_tokens,
             workspace,
@@ -137,6 +136,7 @@ def get_moe_alltoall_module():
             top_k,
             combine_payload_offset,
             payload_in_workspace,
+            output,
         )
 
     @register_custom_op(
@@ -327,8 +327,58 @@ def moe_a2a_combine(
     top_k: int,
     combine_payload_offset: int,
     payload_in_workspace: bool = False,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    return get_moe_alltoall_module().moe_a2a_combine(
+    r"""Combine per-expert outputs back to the originating ranks.
+
+    Inverse of :func:`moe_a2a_dispatch`: scatters the rank-local expert
+    output rows back to the ranks that supplied the original tokens.
+
+    Parameters
+    ----------
+    payload : torch.Tensor
+        Output payload to send back to the source ranks.  Shape
+        ``[ep_size, runtime_max_tokens_per_rank, *]`` regardless of
+        ``payload_in_workspace``: in both cases the payload holds the
+        per-expert-rank outputs to be combined back to the source ranks.
+        Only the backing memory differs (caller-supplied vs. workspace-backed
+        view produced by :meth:`MoeAlltoAll.get_combine_payload_tensor_in_workspace`).
+    local_num_tokens : int
+        Number of tokens originally dispatched from this rank.
+    workspace : torch.Tensor
+        Shared workspace tensor (same one passed to dispatch).
+    metainfo : torch.Tensor
+        Metainfo tensor returned by :func:`moe_a2a_initialize`.
+    runtime_max_tokens_per_rank : int
+        Same value passed to :func:`moe_a2a_dispatch`.
+    ep_rank : int
+        Current expert-parallel rank.
+    ep_size : int
+        Total expert-parallel world size.
+    top_k : int
+        Number of experts assigned per token.
+    combine_payload_offset : int
+        Offset returned by :func:`moe_a2a_dispatch`.
+    payload_in_workspace : bool
+        ``True`` if ``payload`` is already a workspace-backed view (skips
+        the staging copy).  Defaults to ``False``.
+    output : torch.Tensor, optional
+        Destination tensor with shape ``[local_num_tokens, elements_per_token]``.
+        A new tensor is allocated when omitted.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[local_num_tokens, *]`` tensor with the combined outputs.
+    """
+    if output is None:
+        output = torch.empty(
+            (local_num_tokens, payload.size(2)),
+            dtype=payload.dtype,
+            device=payload.device,
+        )
+
+    get_moe_alltoall_module().moe_a2a_combine(
         payload,
         local_num_tokens,
         workspace,
@@ -339,7 +389,9 @@ def moe_a2a_combine(
         top_k,
         combine_payload_offset,
         payload_in_workspace,
+        output,
     )
+    return output
 
 
 @flashinfer_api
@@ -658,14 +710,25 @@ class MoeAlltoAll:
         payload: torch.Tensor,
         runtime_max_tokens_per_rank: int,
         payload_in_workspace: bool = False,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform MoE all-to-all combine operation.
 
-        Args:
-            payload: [ep_size, max_tokens, elements_per_token] tensor
-            runtime_max_tokens_per_rank: Max tokens per rank in this batch
-            payload_in_workspace: If True, payload is workspace-backed (skip staging)
+        Parameters
+        ----------
+        payload : torch.Tensor
+            ``[ep_size, runtime_max_tokens_per_rank, elements_per_token]``
+            output payload to scatter back to source ranks.
+        runtime_max_tokens_per_rank : int
+            Maximum tokens per rank in this batch (same value passed to
+            :meth:`dispatch`).
+        payload_in_workspace : bool
+            ``True`` if ``payload`` is already a workspace-backed view (skips
+            the staging copy).  Defaults to ``False``.
+        output : torch.Tensor, optional
+            Destination tensor with shape ``[local_num_tokens, elements_per_token]``.
+            A new tensor is allocated when omitted.
 
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
@@ -688,6 +751,7 @@ class MoeAlltoAll:
             self.top_k,
             self._state.combine_payload_offset,
             payload_in_workspace,
+            output,
         )
 
         # Reset state for next round
