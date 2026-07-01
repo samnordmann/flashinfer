@@ -52,8 +52,12 @@ from .allreduce import (
 
 # MNNVL A2A (Throughput Backend)
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
+from .trtllm_moe_alltoall import MoeA2APayloadLayout as MoeA2APayloadLayout
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
+from .trtllm_moe_alltoall import (
+    moe_a2a_get_dispatch_payload_size as moe_a2a_get_dispatch_payload_size,
+)
 from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
 from .trtllm_moe_alltoall import (
     moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,

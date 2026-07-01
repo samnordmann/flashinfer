@@ -25,11 +25,17 @@ static constexpr int kMaxTopK = 22;     // Maximum supported top-k experts per t
 static constexpr int kMaxPayloads = 4;  // Maximum number of different payload types
 static constexpr int kMaxRanks = 64;    // Maximum supported EP size
 
+enum class PayloadLayout : int {
+  LINEAR = 0,
+  R128C4 = 1,
+};
+
 // Describes a single payload type to be communicated
 struct PayloadDescriptor {
   void const* src_data;    // Source data pointer [local_num_tokens, elements_per_token]
   int element_size;        // Size of each element in bytes
   int elements_per_token;  // Number of elements per token (e.g., hidden_size, top_k)
+  PayloadLayout output_layout;
 };
 
 // Kernel pointers packed into a struct for device access
@@ -39,6 +45,9 @@ struct DispatchKernelPointers {
   void const* src_data_ptrs[kMaxPayloads];      // Array of source data pointers
   void* recv_buffers[kMaxRanks][kMaxPayloads];  // 2D array of receive buffer pointers
   int payload_bytes_per_token[kMaxPayloads];    // Bytes per token for each payload
+  int payload_elements_per_token[kMaxPayloads];
+  int payload_element_sizes[kMaxPayloads];
+  PayloadLayout payload_output_layouts[kMaxPayloads];
 
   // Completion flags for synchronization
   uint32_t*

@@ -5,12 +5,13 @@ This module provides the throughput-optimized all-to-all backend for MoE expert 
 supporting multiple payloads per collective operation.
 """
 
+import functools
 from dataclasses import dataclass
+from enum import IntEnum
 from types import SimpleNamespace
 from typing import Optional
 
 import torch
-import functools
 
 from ..api_logging import flashinfer_api
 
@@ -18,6 +19,24 @@ from .mnnvl import MnnvlMemory, MnnvlConfig
 from .mapping import Mapping
 from ..jit.comm import gen_moe_alltoall_module
 from ..utils import register_custom_op
+
+
+class MoeA2APayloadLayout(IntEnum):
+    """Physical layout used for a dispatched payload's receive buffer."""
+
+    LINEAR = 0
+    R128C4 = 1
+
+
+def _normalize_output_payload_layouts(
+    input_payloads: list[torch.Tensor],
+    output_payload_layouts: Optional[list[MoeA2APayloadLayout]],
+) -> list[int]:
+    if output_payload_layouts is None:
+        return [int(MoeA2APayloadLayout.LINEAR)] * len(input_payloads)
+    if len(output_payload_layouts) != len(input_payloads):
+        raise ValueError("output_payload_layouts must match input_payloads")
+    return [int(MoeA2APayloadLayout(layout)) for layout in output_payload_layouts]
 
 
 @dataclass
@@ -53,6 +72,7 @@ def get_moe_alltoall_module():
     def moe_a2a_dispatch(
         token_selected_experts: torch.Tensor,
         input_payloads: list[torch.Tensor],
+        output_payload_layouts: list[int],
         workspace: torch.Tensor,
         metainfo: torch.Tensor,
         runtime_max_tokens_per_rank: int,
@@ -83,6 +103,7 @@ def get_moe_alltoall_module():
         return module.moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
+            output_payload_layouts,
             workspace,
             metainfo,
             runtime_max_tokens_per_rank,
@@ -245,12 +266,10 @@ def moe_a2a_wrap_payload_tensor_in_workspace(
     assert local_slice_end <= workspace_base.shape[1], (
         "slice must fall within the workspace size per rank"
     )
-    result = (
-        workspace_base[slice_rank, local_slice_start:local_slice_end]
-        .view(dtype=dtype)
-        .view(*leading_shape, -1)
+    result = workspace_base[slice_rank, local_slice_start:local_slice_end].view(
+        dtype=dtype
     )
-    return result
+    return result.view(*leading_shape, -1) if leading_shape else result.view(-1)
 
 
 @flashinfer_api
@@ -264,6 +283,7 @@ def moe_a2a_dispatch(
     ep_size: int,
     top_k: int,
     num_experts: int,
+    output_payload_layouts: Optional[list[MoeA2APayloadLayout]] = None,
 ):
     """
     Dispatch tokens and payloads to expert ranks.
@@ -271,6 +291,9 @@ def moe_a2a_dispatch(
     Args:
         token_selected_experts: [local_num_tokens, top_k] int32 tensor
         input_payloads: List of [local_num_tokens, *] tensors to dispatch
+        output_payload_layouts: Optional physical receive layout for each payload.
+            Defaults to LINEAR for every payload. R128C4 payloads are returned
+            as flat physical buffers including row and column padding.
         workspace: [ep_size, size_per_rank] workspace tensor
         metainfo: Metadata tensor from initialize
         runtime_max_tokens_per_rank: Max tokens per rank in this batch
@@ -283,10 +306,14 @@ def moe_a2a_dispatch(
         output_payloads: List of payloads for this rank, backed by data in the workspace
         combine_payload_offset: The offset to place the combine payload in the workspace
     """
+    normalized_layouts = _normalize_output_payload_layouts(
+        input_payloads, output_payload_layouts
+    )
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,
             input_payloads,
+            normalized_layouts,
             workspace,
             metainfo,
             runtime_max_tokens_per_rank,
@@ -298,14 +325,23 @@ def moe_a2a_dispatch(
     )
 
     output_payloads = []
-    for input_payload, offset, size in zip(
-        input_payloads, recv_offsets, recv_sizes, strict=True
+    if len(recv_offsets) != len(input_payloads) or len(recv_sizes) != len(
+        input_payloads
     ):
+        raise RuntimeError("dispatch returned inconsistent payload metadata")
+    for payload_index, input_payload in enumerate(input_payloads):
+        layout = normalized_layouts[payload_index]
+        offset = recv_offsets[payload_index]
+        size = recv_sizes[payload_index]
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
         output_payloads.append(
             moe_a2a_wrap_payload_tensor_in_workspace(
                 workspace,
-                [ep_size, runtime_max_tokens_per_rank],
+                (
+                    [ep_size, runtime_max_tokens_per_rank]
+                    if layout == int(MoeA2APayloadLayout.LINEAR)
+                    else []
+                ),
                 offset,
                 offset + size,
                 input_payload.dtype,
@@ -413,6 +449,7 @@ def moe_a2a_get_workspace_size_per_rank(
     max_num_tokens: int,
     total_dispatch_payload_size_per_token: int,
     combine_payload_size_per_token: int,
+    dispatch_payload_sizes: Optional[list[int]] = None,
 ):
     """
     Get the workspace size per rank for the MoeAlltoAll operation.
@@ -422,6 +459,8 @@ def moe_a2a_get_workspace_size_per_rank(
         max_num_tokens: Maximum number of tokens across all ranks
         total_dispatch_payload_size_per_token: The size of the payload per token in the dispatch phase. This should be the sum of all payloads.
         combine_payload_size_per_token: The size of the payload per token in the combine phase.
+        dispatch_payload_sizes: Optional exact physical byte size for each
+            dispatch payload. Use this when a payload has a non-linear layout.
 
     Returns:
         workspace_size_per_rank: Size of the workspace per rank in bytes
@@ -435,11 +474,37 @@ def moe_a2a_get_workspace_size_per_rank(
         return ((x + y - 1) // y) * y
 
     # Pad to 128 bytes to ensure alignment. This matches the implementation of C++ torch OP code.
+    dispatch_payload_size = (
+        sum(dispatch_payload_sizes)
+        if dispatch_payload_sizes is not None
+        else ep_size * max_num_tokens * total_dispatch_payload_size_per_token
+    )
     return (
         pad_up(aux_data_size, 128)
-        + pad_up(ep_size * max_num_tokens * total_dispatch_payload_size_per_token, 128)
+        + pad_up(dispatch_payload_size, 128)
         + pad_up(ep_size * max_num_tokens * combine_payload_size_per_token, 128)
     )
+
+
+def moe_a2a_get_dispatch_payload_size(
+    ep_size: int,
+    max_num_tokens: int,
+    elements_per_token: int,
+    element_size: int,
+    output_layout: MoeA2APayloadLayout = MoeA2APayloadLayout.LINEAR,
+) -> int:
+    """Return the physical receive-buffer size for one dispatch payload."""
+    layout = MoeA2APayloadLayout(output_layout)
+    if min(ep_size, max_num_tokens, elements_per_token, element_size) <= 0:
+        raise ValueError("payload dimensions and element_size must be positive")
+    if layout == MoeA2APayloadLayout.LINEAR:
+        return ep_size * max_num_tokens * elements_per_token * element_size
+    if element_size not in (1, 2):
+        raise ValueError("R128C4 payloads require one- or two-byte elements")
+
+    rows = ((ep_size * max_num_tokens + 127) // 128) * 128
+    columns = ((elements_per_token + 3) // 4) * 4
+    return rows * columns * element_size
 
 
 class MoeAlltoAll:
@@ -652,6 +717,7 @@ class MoeAlltoAll:
         runtime_max_tokens_per_rank: int,
         invalid_token_expert_id: Optional[int] = None,
         expert_id_payload_index: Optional[int] = None,
+        output_payload_layouts: Optional[list[MoeA2APayloadLayout]] = None,
     ) -> list[torch.Tensor]:
         """
         Perform MoE all-to-all dispatch operation.
@@ -662,6 +728,7 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank: Max tokens per rank in this batch
             invalid_token_expert_id: If set, sanitize invalid tokens to this ID
             expert_id_payload_index: Index of expert IDs in input_payloads (required if invalid_token_expert_id is set)
+            output_payload_layouts: Optional physical receive layout per payload.
 
         Returns:
             recv_tensors: List of [ep_size, max_tokens, *] tensors
@@ -681,6 +748,7 @@ class MoeAlltoAll:
             self.ep_size,
             self.top_k,
             self.num_experts,
+            output_payload_layouts,
         )
 
         # Update state
@@ -798,8 +866,10 @@ class MoeAlltoAll:
 
 __all__ = [
     "MoeAlltoAll",
+    "MoeA2APayloadLayout",
     "moe_a2a_combine",
     "moe_a2a_dispatch",
+    "moe_a2a_get_dispatch_payload_size",
     "moe_a2a_get_workspace_size_per_rank",
     "moe_a2a_initialize",
     "moe_a2a_sanitize_expert_ids",

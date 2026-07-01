@@ -98,6 +98,90 @@ def make_payload(num_tokens, vector_dim, dtype):
         )
 
 
+def _r128c4_offset(row: int, column: int, columns: int) -> int:
+    num_column_tiles = (columns + 3) // 4
+    return (
+        (row // 128) * num_column_tiles * 512
+        + (column // 4) * 512
+        + (row % 32) * 16
+        + ((row % 128) // 32) * 4
+        + column % 4
+    )
+
+
+def test_r128c4_dispatch_payload_size():
+    size = trtllm_moe_alltoall.moe_a2a_get_dispatch_payload_size(
+        ep_size=4,
+        max_num_tokens=33,
+        elements_per_token=7,
+        element_size=1,
+        output_layout=trtllm_moe_alltoall.MoeA2APayloadLayout.R128C4,
+    )
+    assert size == 256 * 8
+
+
+@pytest.mark.skipif(
+    not mnnvl_available(),
+    reason="Mnnvl memory is not supported on this platform or container lacks SYS_PTRACE capability",
+)
+def test_moe_alltoall_r128c4_dispatch_single_gpu():
+    torch.cuda.set_device(0)
+    num_tokens, columns, num_experts, top_k = 5, 7, 8, 2
+    payload = make_payload(num_tokens, columns, torch.uint8)
+    token_selected_experts = torch.randint(
+        0, num_experts, (num_tokens, top_k), dtype=torch.int32, device="cuda"
+    )
+    payload_size = trtllm_moe_alltoall.moe_a2a_get_dispatch_payload_size(
+        1,
+        num_tokens,
+        columns,
+        payload.element_size(),
+        trtllm_moe_alltoall.MoeA2APayloadLayout.R128C4,
+    )
+    workspace_size = trtllm_moe_alltoall.moe_a2a_get_workspace_size_per_rank(
+        1,
+        num_tokens,
+        columns,
+        0,
+        dispatch_payload_sizes=[payload_size],
+    )
+    moe_a2a = trtllm_moe_alltoall.MoeAlltoAll(
+        Mapping(rank=0, world_size=1),
+        num_tokens,
+        top_k,
+        num_experts,
+        workspace_size_per_rank=workspace_size,
+    )
+
+    (received,) = moe_a2a.dispatch(
+        token_selected_experts,
+        [payload],
+        num_tokens,
+        output_payload_layouts=[trtllm_moe_alltoall.MoeA2APayloadLayout.R128C4],
+    )
+
+    assert received.ndim == 1
+    assert received.numel() == payload_size
+    logical = torch.stack(
+        [
+            received[
+                torch.tensor(
+                    [_r128c4_offset(row, col, columns) for col in range(columns)],
+                    device="cuda",
+                )
+            ]
+            for row in range(num_tokens)
+        ]
+    )
+    torch.testing.assert_close(
+        torch.sort(logical, dim=0).values,
+        torch.sort(payload, dim=0).values,
+        atol=0,
+        rtol=0,
+    )
+    moe_a2a._reset_workspace()
+
+
 @pytest.mark.parametrize(
     "num_tokens,vector_dim,num_experts,top_k",
     SINGLE_GPU_PARAMS,

@@ -117,9 +117,10 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
 }
 
 Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
-    TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
-    TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts) {
+    TensorView tokenSelectedExperts, Array<Tensor> inputPayloads,
+    Array<int64_t> outputPayloadLayouts, TensorView workspace, TensorView metainfo,
+    int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
+    int64_t numExperts) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -131,6 +132,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   TVM_FFI_ICHECK(numPayloads > 0) << "At least one payload is required";
   TVM_FFI_ICHECK(numPayloads <= tl_throughput::kMaxPayloads)
       << "Too many payloads: " << numPayloads << " > " << tl_throughput::kMaxPayloads;
+  TVM_FFI_ICHECK_EQ(outputPayloadLayouts.size(), inputPayloads.size())
+      << "output_payload_layouts must match input_payloads";
 
   auto localNumTokens = static_cast<int>(tokenSelectedExperts.size(0));
   TVM_FFI_ICHECK(localNumTokens >= 0) << "local_num_tokens must be non-negative";
@@ -170,13 +173,29 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
     auto const& payload = inputPayloads[i];
     int elementsPerToken = static_cast<int>(payload.size(1));
     int elementSize = static_cast<int>(get_element_size(payload));
+    int64_t outputLayout = outputPayloadLayouts[i];
+    TVM_FFI_ICHECK(outputLayout == static_cast<int64_t>(tl_throughput::PayloadLayout::LINEAR) ||
+                   outputLayout == static_cast<int64_t>(tl_throughput::PayloadLayout::R128C4))
+        << "Unsupported output payload layout " << outputLayout << " for payload " << i;
+    if (outputLayout == static_cast<int64_t>(tl_throughput::PayloadLayout::R128C4)) {
+      TVM_FFI_ICHECK(elementSize == 1 || elementSize == 2)
+          << "R128C4 payloads require one- or two-byte elements";
+    }
 
     payloadDescriptors[i].src_data = payload.data_ptr();
     payloadDescriptors[i].element_size = elementSize;
     payloadDescriptors[i].elements_per_token = elementsPerToken;
+    payloadDescriptors[i].output_layout = static_cast<tl_throughput::PayloadLayout>(outputLayout);
 
-    int64_t bytesPerPayload =
-        static_cast<int64_t>(epSize) * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+    int64_t bytesPerPayload;
+    if (payloadDescriptors[i].output_layout == tl_throughput::PayloadLayout::R128C4) {
+      int64_t rows = alignOffset(epSize * runtimeMaxTokensPerRank, 128);
+      int64_t columns = (elementsPerToken + 3) / 4 * 4;
+      bytesPerPayload = rows * columns * elementSize;
+    } else {
+      bytesPerPayload =
+          static_cast<int64_t>(epSize) * runtimeMaxTokensPerRank * elementsPerToken * elementSize;
+    }
     payloadByteSizes[i] = bytesPerPayload;
     totalBytesNeeded += bytesPerPayload;
 

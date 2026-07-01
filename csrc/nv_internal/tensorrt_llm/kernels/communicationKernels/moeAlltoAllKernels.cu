@@ -281,6 +281,67 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
   }
 }
 
+template <int ELEMENT_SIZE, int TOP_K, typename ThreadingPolicy>
+__device__ void r128c4_dispatch(uint8_t const* src_ptr, int elements_per_token, int rank_id,
+                                int max_tokens_per_rank, int payload_idx,
+                                DispatchKernelPointers const& ptrs, int const* topk_target_ranks,
+                                int const* topk_send_indices) {
+  constexpr int kColumnsPerStore = 4;
+  constexpr int kBytesPerStore = kColumnsPerStore * ELEMENT_SIZE;
+  using flashinfer::vec_t;
+
+  uint8_t* dst_row_base_k[TOP_K];
+  int const num_col_tiles = ceilDiv(elements_per_token, kColumnsPerStore);
+#pragma unroll
+  for (int k = 0; k < TOP_K; ++k) {
+    int const dst_idx = topk_send_indices[k];
+    if (dst_idx < 0) {
+      dst_row_base_k[k] = nullptr;
+      continue;
+    }
+
+    int const target_rank = topk_target_ranks[k];
+    int const row = rank_id * max_tokens_per_rank + dst_idx;
+    // get_sf_out_offset_128x4 flattened at [source_rank, destination_slot, column].
+    int64_t const row_offset = (static_cast<int64_t>(row / 128) * num_col_tiles * 512 +
+                                (row % 32) * 16 + ((row % 128) / 32) * 4) *
+                               ELEMENT_SIZE;
+    dst_row_base_k[k] =
+        static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][payload_idx]) + row_offset;
+  }
+
+  for (int col_tile = ThreadingPolicy::offset(); col_tile < num_col_tiles;
+       col_tile += ThreadingPolicy::stride()) {
+    int const col = col_tile * kColumnsPerStore;
+    if (col + kColumnsPerStore <= elements_per_token &&
+        elements_per_token % kColumnsPerStore == 0) {
+      vec_t<uint8_t, kBytesPerStore> value;
+      value.load(src_ptr + col * ELEMENT_SIZE);
+#pragma unroll
+      for (int k = 0; k < TOP_K; ++k) {
+        if (dst_row_base_k[k] != nullptr) {
+          value.store(dst_row_base_k[k] + static_cast<int64_t>(col_tile) * 512 * ELEMENT_SIZE);
+        }
+      }
+    } else {
+      uint8_t value[kBytesPerStore] = {};
+      int valid_bytes = (elements_per_token - col) * ELEMENT_SIZE;
+      if (valid_bytes > kBytesPerStore) valid_bytes = kBytesPerStore;
+#pragma unroll
+      for (int byte = 0; byte < kBytesPerStore; ++byte) {
+        if (byte < valid_bytes) value[byte] = src_ptr[col * ELEMENT_SIZE + byte];
+      }
+#pragma unroll
+      for (int k = 0; k < TOP_K; ++k) {
+        if (dst_row_base_k[k] == nullptr) continue;
+        uint8_t* dst = dst_row_base_k[k] + static_cast<int64_t>(col_tile) * 512 * ELEMENT_SIZE;
+#pragma unroll
+        for (int byte = 0; byte < kBytesPerStore; ++byte) dst[byte] = value[byte];
+      }
+    }
+  }
+}
+
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
                                             int ep_size, uint32_t* flag_val_ptr) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -385,9 +446,22 @@ __global__ void moeA2ADispatchKernel(
       int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
       uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                  max_tokens_per_rank, payload_idx, ptrs,
-                                                  topk_target_ranks, topk_send_indices);
+      if (ptrs.payload_output_layouts[payload_idx] == PayloadLayout::R128C4) {
+        int const elements_per_token = ptrs.payload_elements_per_token[payload_idx];
+        if (ptrs.payload_element_sizes[payload_idx] == 1) {
+          r128c4_dispatch<1, TOP_K, ThreadingPolicy>(src_ptr, elements_per_token, rank_id,
+                                                     max_tokens_per_rank, payload_idx, ptrs,
+                                                     topk_target_ranks, topk_send_indices);
+        } else {
+          r128c4_dispatch<2, TOP_K, ThreadingPolicy>(src_ptr, elements_per_token, rank_id,
+                                                     max_tokens_per_rank, payload_idx, ptrs,
+                                                     topk_target_ranks, topk_send_indices);
+        }
+      } else {
+        vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
+                                                    max_tokens_per_rank, payload_idx, ptrs,
+                                                    topk_target_ranks, topk_send_indices);
+      }
     }
 
     ThreadingPolicy::sync();
@@ -491,6 +565,9 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     kernel_ptrs.src_data_ptrs[i] = params.payloads[i].src_data;
     kernel_ptrs.payload_bytes_per_token[i] =
         params.payloads[i].element_size * params.payloads[i].elements_per_token;
+    kernel_ptrs.payload_elements_per_token[i] = params.payloads[i].elements_per_token;
+    kernel_ptrs.payload_element_sizes[i] = params.payloads[i].element_size;
+    kernel_ptrs.payload_output_layouts[i] = params.payloads[i].output_layout;
   }
 
   // Fill receive buffer pointers
