@@ -647,6 +647,7 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         ("uniform", 2),  # topk=2 with uniform distribution
         ("random", 8),  # topk=8 with random distribution
         ("uniform", 8),  # topk=8 with uniform distribution
+        ("uniform", 22),  # High top-k dispatch compacts to at most ep_size destinations
     ],
 )
 def test_moe_a2a_dispatch(distribution, top_k):

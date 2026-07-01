@@ -281,6 +281,78 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
   }
 }
 
+// Keep larger fanout on the register-cached path; the shared base table targets small-EP MoE.
+constexpr int kCompactDispatchMaxRanks = 8;
+
+__device__ __forceinline__ int dispatch_vector_size(int bytes_per_token, uintptr_t alignment_bits) {
+  if (bytes_per_token % 16 == 0 && (alignment_bits & 15) == 0) return 16;
+  if (bytes_per_token % 8 == 0 && (alignment_bits & 7) == 0) return 8;
+  if (bytes_per_token % 4 == 0 && (alignment_bits & 3) == 0) return 4;
+  if (bytes_per_token % 2 == 0 && (alignment_bits & 1) == 0) return 2;
+  return 1;
+}
+
+// Flatten payloads with the same vector width into one policy-wide work queue. This lets short
+// payloads share a warp while preserving the vector width selected for each payload's alignment.
+template <int VEC_SIZE, typename ThreadingPolicy>
+__device__ void flattened_vectorized_dispatch(DispatchKernelPointers const& ptrs,
+                                              uintptr_t const* dst_bases,
+                                              int const* payload_vector_sizes, int max_destinations,
+                                              int num_destinations, int num_payloads,
+                                              int local_token_idx) {
+  using flashinfer::vec_t;
+
+  int total_units = 0;
+#pragma unroll
+  for (int payload_idx = 0; payload_idx < kMaxPayloads; ++payload_idx) {
+    if (payload_idx < num_payloads && payload_vector_sizes[payload_idx] == VEC_SIZE) {
+      total_units += ptrs.payload_bytes_per_token[payload_idx] / VEC_SIZE;
+    }
+  }
+
+  for (int work_idx = ThreadingPolicy::offset(); work_idx < total_units;
+       work_idx += ThreadingPolicy::stride()) {
+    int payload_idx = -1;
+    int payload_unit = work_idx;
+#pragma unroll
+    for (int candidate = 0; candidate < kMaxPayloads; ++candidate) {
+      if (payload_idx < 0 && candidate < num_payloads &&
+          payload_vector_sizes[candidate] == VEC_SIZE) {
+        int units = ptrs.payload_bytes_per_token[candidate] / VEC_SIZE;
+        if (payload_unit < units) {
+          payload_idx = candidate;
+        } else {
+          payload_unit -= units;
+        }
+      }
+    }
+
+    int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+    size_t offset = static_cast<size_t>(payload_unit) * VEC_SIZE;
+    auto const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+    auto const* src_ptr =
+        src_data + static_cast<size_t>(local_token_idx) * bytes_per_token + offset;
+
+    vec_t<uint8_t, VEC_SIZE> value;
+    value.load(src_ptr);
+
+#pragma unroll 1
+    for (int destination = 0; destination < num_destinations; ++destination) {
+      auto* dst_base =
+          reinterpret_cast<uint8_t*>(dst_bases[payload_idx * max_destinations + destination]);
+      value.store(dst_base + offset);
+    }
+  }
+}
+
+inline size_t compact_dispatch_shared_bytes(int num_tiles, int max_destinations, int num_payloads) {
+  size_t metadata_bytes = 2 * static_cast<size_t>(num_tiles) * max_destinations * sizeof(int);
+  size_t destination_bytes =
+      static_cast<size_t>(num_tiles) * num_payloads * max_destinations * sizeof(uintptr_t);
+  size_t vector_size_bytes = static_cast<size_t>(num_tiles) * num_payloads * sizeof(int);
+  return metadata_bytes + destination_bytes + vector_size_bytes;
+}
+
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
                                             int ep_size, uint32_t* flag_val_ptr) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -304,7 +376,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K>
+template <typename ThreadingPolicy, int TOP_K, bool FLATTEN_PAYLOADS>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
@@ -323,21 +395,33 @@ __global__ void moeA2ADispatchKernel(
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
 
-    // Prepare per-policy shared-memory tiles for this token
-    extern __shared__ int smem[];
-    int* smem_topk_target_ranks;
-    int* smem_topk_send_indices;
+    // Prepare per-policy shared-memory tiles for this token.
+    extern __shared__ __align__(16) uint8_t smem[];
+    int* smem_target_ranks;
+    int* smem_send_indices;
+    uintptr_t* smem_dst_bases = nullptr;
+    int* smem_payload_vector_sizes = nullptr;
     int warps_per_block = blockDim.x / warpSize;
-    if constexpr (std::is_same<ThreadingPolicy, WarpPolicy>::value) {
-      int lane_id = threadIdx.x / warpSize;
-      smem_topk_target_ranks = smem + lane_id * TOP_K;
-      smem_topk_send_indices = smem + warps_per_block * TOP_K + lane_id * TOP_K;
-    } else {
-      smem_topk_target_ranks = smem;
-      smem_topk_send_indices = smem + TOP_K;
+    int num_tiles = std::is_same<ThreadingPolicy, WarpPolicy>::value ? warps_per_block : 1;
+    int tile_idx = std::is_same<ThreadingPolicy, WarpPolicy>::value ? threadIdx.x / warpSize : 0;
+    int max_destinations = FLATTEN_PAYLOADS ? (TOP_K < ep_size ? TOP_K : ep_size) : TOP_K;
+    int metadata_entries = num_tiles * max_destinations;
+    auto* all_target_ranks = reinterpret_cast<int*>(smem);
+    auto* all_send_indices = all_target_ranks + metadata_entries;
+    smem_target_ranks = all_target_ranks + tile_idx * max_destinations;
+    smem_send_indices = all_send_indices + tile_idx * max_destinations;
+
+    if constexpr (FLATTEN_PAYLOADS) {
+      auto* all_dst_bases = reinterpret_cast<uintptr_t*>(all_send_indices + metadata_entries);
+      auto* all_payload_vector_sizes = reinterpret_cast<int*>(
+          all_dst_bases + static_cast<size_t>(num_tiles) * num_payloads * max_destinations);
+      smem_dst_bases =
+          all_dst_bases + static_cast<size_t>(tile_idx) * num_payloads * max_destinations;
+      smem_payload_vector_sizes = all_payload_vector_sizes + tile_idx * num_payloads;
     }
 
     uint64_t already_copied = 0;
+    int num_destinations = 0;
     for (int k = 0; k < TOP_K; k++) {
       int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
       // Use contiguous partitioning to determine target rank
@@ -347,9 +431,10 @@ __global__ void moeA2ADispatchKernel(
         if (thread_idx == 0) {
           ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = -1;
           ptrs.topk_send_indices[local_token_idx * TOP_K + k] = -1;
-          // Mirror to shared memory immediately
-          smem_topk_target_ranks[k] = -1;
-          smem_topk_send_indices[k] = -1;
+          if constexpr (!FLATTEN_PAYLOADS) {
+            smem_target_ranks[k] = -1;
+            smem_send_indices[k] = -1;
+          }
         }
         continue;
       }
@@ -361,33 +446,83 @@ __global__ void moeA2ADispatchKernel(
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        // Mirror to shared memory immediately
-        smem_topk_target_ranks[k] = target_rank;
-        smem_topk_send_indices[k] = dst_token_idx;
+        int metadata_idx = FLATTEN_PAYLOADS ? num_destinations : k;
+        smem_target_ranks[metadata_idx] = target_rank;
+        smem_send_indices[metadata_idx] = dst_token_idx;
       }
+      ++num_destinations;
       already_copied |= 1ULL << target_rank;
     }
     // Sync before dispatching data
     ThreadingPolicy::sync();
 
-    // Read staged routing once into registers per thread
-    int topk_target_ranks[TOP_K];
-    int topk_send_indices[TOP_K];
+    if constexpr (FLATTEN_PAYLOADS) {
+      // Compute each payload/destination base once per token tile, rather than once per lane.
+      int destination_entries = num_payloads * num_destinations;
+      for (int entry = thread_idx; entry < destination_entries;
+           entry += ThreadingPolicy::stride()) {
+        int payload_idx = entry / num_destinations;
+        int destination = entry - payload_idx * num_destinations;
+        int target_rank = smem_target_ranks[destination];
+        int dst_token_idx = smem_send_indices[destination];
+        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+        auto* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][payload_idx]);
+        size_t token_slot = static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_token_idx;
+        smem_dst_bases[payload_idx * max_destinations + destination] =
+            reinterpret_cast<uintptr_t>(dst_data + token_slot * bytes_per_token);
+      }
+      ThreadingPolicy::sync();
+
+      // Pick a safe width from both size and actual source/destination alignment.
+      if (thread_idx < num_payloads) {
+        int payload_idx = thread_idx;
+        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+        auto const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+        uintptr_t alignment_bits = reinterpret_cast<uintptr_t>(
+            src_data + static_cast<size_t>(local_token_idx) * bytes_per_token);
+        for (int destination = 0; destination < num_destinations; ++destination) {
+          alignment_bits |= smem_dst_bases[payload_idx * max_destinations + destination];
+        }
+        smem_payload_vector_sizes[payload_idx] =
+            dispatch_vector_size(bytes_per_token, alignment_bits);
+      }
+      ThreadingPolicy::sync();
+
+      flattened_vectorized_dispatch<16, ThreadingPolicy>(
+          ptrs, smem_dst_bases, smem_payload_vector_sizes, max_destinations, num_destinations,
+          num_payloads, local_token_idx);
+      flattened_vectorized_dispatch<8, ThreadingPolicy>(
+          ptrs, smem_dst_bases, smem_payload_vector_sizes, max_destinations, num_destinations,
+          num_payloads, local_token_idx);
+      flattened_vectorized_dispatch<4, ThreadingPolicy>(
+          ptrs, smem_dst_bases, smem_payload_vector_sizes, max_destinations, num_destinations,
+          num_payloads, local_token_idx);
+      flattened_vectorized_dispatch<2, ThreadingPolicy>(
+          ptrs, smem_dst_bases, smem_payload_vector_sizes, max_destinations, num_destinations,
+          num_payloads, local_token_idx);
+      flattened_vectorized_dispatch<1, ThreadingPolicy>(
+          ptrs, smem_dst_bases, smem_payload_vector_sizes, max_destinations, num_destinations,
+          num_payloads, local_token_idx);
+    } else {
+      // Preserve the original register-cached path for larger destination fanout.
+      int topk_target_ranks[TOP_K];
+      int topk_send_indices[TOP_K];
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k) {
-      topk_target_ranks[k] = smem_topk_target_ranks[k];
-      topk_send_indices[k] = smem_topk_send_indices[k];
-    }
+      for (int k = 0; k < TOP_K; ++k) {
+        topk_target_ranks[k] = smem_target_ranks[k];
+        topk_send_indices[k] = smem_send_indices[k];
+      }
 
-    // Perform a single source load and TOP_K fanout per payload
-    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
-      uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-      int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-      uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+      // Perform a single source load and TOP_K fanout per payload
+      for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
+        uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+        uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
 
-      vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
-                                                  max_tokens_per_rank, payload_idx, ptrs,
-                                                  topk_target_ranks, topk_send_indices);
+        vectorized_dispatch<TOP_K, ThreadingPolicy>(src_ptr, bytes_per_token, rank_id,
+                                                    max_tokens_per_rank, payload_idx, ptrs,
+                                                    topk_target_ranks, topk_send_indices);
+      }
     }
 
     ThreadingPolicy::sync();
@@ -516,6 +651,9 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
   constexpr int kWarpSize = 32;
   int const kWarpsPerBlock = kBlockSize / kWarpSize;
+  bool const flatten_payloads =
+      params.num_payloads > 1 && params.ep_size <= kCompactDispatchMaxRanks;
+  int const max_destinations = params.top_k < params.ep_size ? params.top_k : params.ep_size;
 
   // Configure kernel launch
   if (params.one_block_per_token) {
@@ -525,13 +663,16 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     if (grid_size == 0) {
       grid_size = 1;
     }
-    int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<BlockPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    size_t shared_bytes =
+        flatten_payloads ? compact_dispatch_shared_bytes(1, max_destinations, params.num_payloads)
+                         : 2 * params.top_k * sizeof(int);
+    SWITCH_BOOL(flatten_payloads, FLATTEN_PAYLOADS,
+                SWITCH_TOP_K(params.top_k, TOP_K,
+                             moeA2ADispatchKernel<BlockPolicy, TOP_K, FLATTEN_PAYLOADS>
+                             <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+                                 params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                 params.max_tokens_per_rank, params.local_num_tokens,
+                                 params.ep_rank, params.ep_size, params.num_experts_per_rank)))
   } else {
     int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
     // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
@@ -539,13 +680,17 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     if (grid_size == 0) {
       grid_size = 1;
     }
-    int shared_bytes = 2 * kWarpsPerBlock * params.top_k * (int)sizeof(int);
-    SWITCH_TOP_K(params.top_k, TOP_K,
-                 moeA2ADispatchKernel<WarpPolicy, TOP_K>
-                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+    size_t shared_bytes =
+        flatten_payloads
+            ? compact_dispatch_shared_bytes(kWarpsPerBlock, max_destinations, params.num_payloads)
+            : 2 * kWarpsPerBlock * params.top_k * sizeof(int);
+    SWITCH_BOOL(flatten_payloads, FLATTEN_PAYLOADS,
+                SWITCH_TOP_K(params.top_k, TOP_K,
+                             moeA2ADispatchKernel<WarpPolicy, TOP_K, FLATTEN_PAYLOADS>
+                             <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+                                 params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                 params.max_tokens_per_rank, params.local_num_tokens,
+                                 params.ep_rank, params.ep_size, params.num_experts_per_rank)))
   }
 }
 
