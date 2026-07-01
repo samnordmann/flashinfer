@@ -361,7 +361,8 @@ def get_fp4_quantization_module(backend: str = "100"):
             unswizzled_sf (torch.Tensor): unswizzled block scale tensor with dtype uint8 or bfloat16.
 
         Returns:
-            torch.Tensor: output tensor for swizzled block scale with dtype uint8 or bfloat16.
+            torch.Tensor: Flat physical buffer. Its size is the batch count times
+                ``round_up(rows, 128) * round_up(columns, 4)``.
         """
         num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
         expert_out_size = _compute_swizzled_layout_sf_size(
@@ -379,8 +380,12 @@ def get_fp4_quantization_module(backend: str = "100"):
     def _fake_block_scale_interleave_sm100(
         unswizzled_sf: torch.Tensor,
     ) -> torch.Tensor:
+        num_experts = unswizzled_sf.shape[0] if unswizzled_sf.dim() == 3 else 1
+        expert_out_size = _compute_swizzled_layout_sf_size(
+            unswizzled_sf.shape[-2], unswizzled_sf.shape[-1], 128
+        )
         return unswizzled_sf.new_empty(
-            [unswizzled_sf.shape[0] * unswizzled_sf.shape[1] // 16], dtype=torch.uint8
+            [num_experts * expert_out_size], dtype=unswizzled_sf.dtype
         )
 
     @register_custom_op(
@@ -957,13 +962,17 @@ def block_scale_interleave(unswizzled_sf: torch.Tensor) -> torch.Tensor:
     """Swizzle block scale tensor for FP4 format.
 
     This function swizzles the block scale tensor to optimize memory access patterns
-    for FP4 operations. The output needs to be padded in the m dimension to be a multiple of 128.
+    for FP4 operations. It pads rows to a multiple of 128 and columns to a multiple
+    of 4.
 
     Args:
         unswizzled_sf (torch.Tensor): Input tensor with dtype uint8 or bfloat16.
 
     Returns:
-        torch.Tensor: Swizzled tensor with the same shape as input.
+        torch.Tensor: Flat physical buffer containing the swizzled scales. For a
+            two-dimensional input its length is
+            ``round_up(rows, 128) * round_up(columns, 4)``. A three-dimensional
+            input stores one such region per leading-dimension entry.
 
     Raises:
         AssertionError: If input dtype is not uint8 or bfloat16.
