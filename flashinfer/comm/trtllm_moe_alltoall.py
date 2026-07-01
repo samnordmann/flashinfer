@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 import functools
+import os
 
 from ..api_logging import flashinfer_api
 
@@ -32,7 +33,12 @@ class _A2AState:
 @functools.cache
 def get_moe_alltoall_module():
     """Get or build the MOE A2A JIT module."""
-    module = gen_moe_alltoall_module().build_and_load()
+    spec = gen_moe_alltoall_module()
+    if os.environ.get("FLASHINFER_FORCE_JIT_MOE_A2A") == "1":
+        spec.build(verbose=os.environ.get("FLASHINFER_JIT_VERBOSE") == "1")
+        module = spec.load(spec.jit_library_path)
+    else:
+        module = spec.build_and_load()
 
     @register_custom_op(
         "flashinfer::moe_a2a_initialize",
