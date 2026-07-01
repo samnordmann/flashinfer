@@ -15,6 +15,7 @@
  */
 #include <cooperative_groups.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <type_traits>
 
@@ -164,6 +165,8 @@ struct WarpPolicy {
 
   __device__ static int token_idx() { return (blockIdx.x * blockDim.x + threadIdx.x) / warpSize; }
 
+  __device__ static int token_stride() { return gridDim.x * blockDim.x / warpSize; }
+
   __device__ static void sync() { __syncwarp(); }
 };
 
@@ -173,6 +176,8 @@ struct BlockPolicy {
   __device__ static int offset() { return threadIdx.x; }
 
   __device__ static int token_idx() { return blockIdx.x; }
+
+  __device__ static int token_stride() { return gridDim.x; }
 
   __device__ static void sync() { __syncthreads(); }
 };
@@ -794,25 +799,24 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 
   if (payload_bytes == nullptr) return;
 
-  int slot_idx = ThreadingPolicy::token_idx();
-
   int total_slots = ep_size * max_tokens_per_rank;
-  if (slot_idx >= total_slots) return;
+  for (int slot_idx = ThreadingPolicy::token_idx(); slot_idx < total_slots;
+       slot_idx += ThreadingPolicy::token_stride()) {
+    // Map global token to (source_rank, token_idx)
+    int source_rank = slot_idx / max_tokens_per_rank;
+    int token_idx = slot_idx % max_tokens_per_rank;
 
-  // Map global token to (source_rank, token_idx)
-  int source_rank = slot_idx / max_tokens_per_rank;
-  int token_idx = slot_idx % max_tokens_per_rank;
+    // Skip invalid tokens beyond per-source recv count
+    if (token_idx >= recv_counters[source_rank]) continue;
 
-  // Skip invalid tokens beyond per-source recv count
-  if (token_idx >= recv_counters[source_rank]) return;
+    // Calculate source and destination pointers for this token
+    size_t slot_offset = static_cast<size_t>(slot_idx) * bytes_per_token;
+    uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
+    uint8_t const* src_ptr = payload_bytes + slot_offset;
 
-  // Calculate source and destination pointers for this token
-  size_t slot_offset = static_cast<size_t>(slot_idx) * bytes_per_token;
-  uint8_t* dst_ptr = recv_buffer_bytes + slot_offset;
-  uint8_t const* src_ptr = payload_bytes + slot_offset;
-
-  // Copy one token's data using vectorized copy with policy
-  vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
+    // Copy one token's data using vectorized copy with policy
+    vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
+  }
 }
 
 // ============================================================================
@@ -930,6 +934,11 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
       params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
   int grid_size_warp = ceilDiv(total_slots, kWarpsPerBlock);
   int grid_size_block = total_slots;  // one block per token
+  int const grid_size_cap = tensorrt_llm::common::getEnvMoeA2APrepareCombineGridSize();
+  if (grid_size_cap > 0) {
+    grid_size_warp = std::min(grid_size_warp, grid_size_cap);
+    grid_size_block = std::min(grid_size_block, grid_size_cap);
+  }
 
   if (params.one_block_per_token) {
     moeA2APrepareCombineKernel<BlockPolicy><<<grid_size_block, kBlockSize, 0, params.stream>>>(

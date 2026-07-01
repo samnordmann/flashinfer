@@ -332,6 +332,11 @@ bool getEnvMoeA2AOneBlockPerToken() {
   return val.value() != 0;
 }
 
+int getEnvMoeA2APrepareCombineGridSize() {
+  static int const kGridSize = getIntEnv("TLLM_MOE_A2A_PREPARE_COMBINE_GRID_SIZE").value_or(256);
+  return kGridSize;
+}
+
 static int sanitizeBlockSize(std::optional<int32_t> const& val) {
   // Default 256 when not set or invalid
   int block = val.value_or(256);

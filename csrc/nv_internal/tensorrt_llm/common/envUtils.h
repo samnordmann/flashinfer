@@ -94,6 +94,8 @@ size_t getEnvMemSizeForKVCacheTransferBuffer();
 
 // Whether to use one block per token for MoE A2A kernels (default true).
 bool getEnvMoeA2AOneBlockPerToken();
+// Maximum CTA count for MoE A2A prepare-combine (default 256, non-positive uses legacy grid).
+int getEnvMoeA2APrepareCombineGridSize();
 
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
