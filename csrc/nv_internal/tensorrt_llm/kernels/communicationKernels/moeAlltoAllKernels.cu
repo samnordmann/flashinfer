@@ -416,6 +416,33 @@ __global__ void moeA2ADispatchKernel(
         ptrs.recv_counters[target_rank][rank_id] = send_count;
       }
 
+      if (ptrs.expert_id_payload_index >= 0) {
+        int expert_ids_per_token =
+            ptrs.payload_bytes_per_token[ptrs.expert_id_payload_index] / sizeof(int32_t);
+
+        // The completion warp owns all source-rank tails. Cooperatively fill each remote slice
+        // before publishing completion so receivers never observe stale expert IDs.
+#pragma unroll 1
+        for (int target_rank = 0; target_rank < ep_size; ++target_rank) {
+          int send_count = ptrs.send_counters[target_rank];
+          int tail_start = send_count < max_tokens_per_rank ? send_count : max_tokens_per_rank;
+          tail_start = tail_start > 0 ? tail_start : 0;
+          size_t tail_elements = static_cast<size_t>(max_tokens_per_rank - tail_start) *
+                                 static_cast<size_t>(expert_ids_per_token);
+          auto* expert_ids =
+              static_cast<int32_t*>(ptrs.recv_buffers[target_rank][ptrs.expert_id_payload_index]);
+          size_t source_offset =
+              (static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
+               static_cast<size_t>(tail_start)) *
+              static_cast<size_t>(expert_ids_per_token);
+
+          for (size_t index = lane_id; index < tail_elements; index += warpSize) {
+            expert_ids[source_offset + index] = ptrs.invalid_expert_id;
+          }
+        }
+        __syncwarp();
+      }
+
 #if !DISABLE_SYNC_FOR_PROFILING
       uint32_t expected_value = *ptrs.flag_val;
 
@@ -512,6 +539,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
   kernel_ptrs.local_token_counter = params.local_token_counter;
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
+  kernel_ptrs.expert_id_payload_index = params.expert_id_payload_index;
+  kernel_ptrs.invalid_expert_id = params.invalid_expert_id;
 
   int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
   constexpr int kWarpSize = 32;

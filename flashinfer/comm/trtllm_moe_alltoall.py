@@ -60,6 +60,8 @@ def get_moe_alltoall_module():
         ep_size: int,
         top_k: int,
         num_experts: int,
+        invalid_expert_id: int,
+        expert_id_payload_index: int,
     ):
         """
         Dispatch tokens and payloads to expert ranks.
@@ -74,6 +76,8 @@ def get_moe_alltoall_module():
             ep_size: Total expert parallel size
             top_k: Number of experts per token
             num_experts: Total number of experts
+            invalid_expert_id: Fill value for fused invalid expert-ID slots
+            expert_id_payload_index: Payload index to sanitize, or -1 to disable
 
         Returns:
             recv_offsets: List of offsets for each payload in the workspace
@@ -90,6 +94,8 @@ def get_moe_alltoall_module():
             ep_size,
             top_k,
             num_experts,
+            invalid_expert_id,
+            expert_id_payload_index,
         )
 
     @register_custom_op(
@@ -264,6 +270,8 @@ def moe_a2a_dispatch(
     ep_size: int,
     top_k: int,
     num_experts: int,
+    invalid_expert_id: Optional[int] = None,
+    expert_id_payload_index: Optional[int] = None,
 ):
     """
     Dispatch tokens and payloads to expert ranks.
@@ -278,11 +286,20 @@ def moe_a2a_dispatch(
         ep_size: Total expert parallel size
         top_k: Number of experts per token
         num_experts: Total number of experts
+        invalid_expert_id: If set, sanitize invalid expert-ID payload slots
+        expert_id_payload_index: Index of the expert-ID payload
 
     Returns:
         output_payloads: List of payloads for this rank, backed by data in the workspace
         combine_payload_offset: The offset to place the combine payload in the workspace
     """
+    fuse_sanitize = (
+        invalid_expert_id is not None
+        and expert_id_payload_index is not None
+        and 0 <= expert_id_payload_index < len(input_payloads)
+        and input_payloads[expert_id_payload_index].dtype == torch.int32
+    )
+
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch(
             token_selected_experts,
@@ -294,6 +311,8 @@ def moe_a2a_dispatch(
             ep_size,
             top_k,
             num_experts,
+            invalid_expert_id if fuse_sanitize else 0,
+            expert_id_payload_index if fuse_sanitize else -1,
         )
     )
 
@@ -310,6 +329,18 @@ def moe_a2a_dispatch(
                 offset + size,
                 input_payload.dtype,
             )
+        )
+
+    if invalid_expert_id is not None and not fuse_sanitize:
+        assert expert_id_payload_index is not None, (
+            "expert_id_payload_index required when invalid_expert_id is set"
+        )
+        moe_a2a_sanitize_expert_ids(
+            output_payloads[expert_id_payload_index],
+            workspace,
+            metainfo,
+            ep_rank,
+            invalid_expert_id,
         )
 
     return output_payloads, combine_payload_offset
@@ -681,26 +712,14 @@ class MoeAlltoAll:
             self.ep_size,
             self.top_k,
             self.num_experts,
+            invalid_token_expert_id,
+            expert_id_payload_index,
         )
 
         # Update state
         self._state.local_num_tokens = token_selected_experts.size(0)
         self._state.combine_payload_offset = combine_payload_offset
         self._state.phase = "dispatched"
-
-        # Sanitize invalid tokens if requested
-        if invalid_token_expert_id is not None:
-            assert expert_id_payload_index is not None, (
-                "expert_id_payload_index required when invalid_token_expert_id is set"
-            )
-            recv_expert_ids = recv_tensors[expert_id_payload_index]
-            moe_a2a_sanitize_expert_ids(
-                recv_expert_ids,
-                self.workspace,
-                self.metainfo,
-                self.ep_rank,
-                invalid_token_expert_id,
-            )
 
         return recv_tensors
 

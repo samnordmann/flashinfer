@@ -189,6 +189,8 @@ def dispatch_from_single_rank(
     num_experts,
     num_tokens,
     hidden_state_index=None,
+    invalid_expert_id=None,
+    expert_id_payload_index=None,
 ):
     payloads = input_tensors
     total_payload_size_per_element = [x[0].numel() * x.itemsize for x in payloads]
@@ -249,6 +251,8 @@ def dispatch_from_single_rank(
                 ep_size=world_size,
                 top_k=rank_token_selected_experts.shape[-1],
                 num_experts=num_experts,
+                invalid_expert_id=invalid_expert_id,
+                expert_id_payload_index=expert_id_payload_index,
             )
             output_tensors.append(output)
             combine_payload_offsets.append(offset)
@@ -363,6 +367,68 @@ def test_moe_alltoall_multi_rank_single_gpu(world_size, num_tokens, vector_dim):
             actual, _ = torch.sort(actual, dim=0)
             ref, _ = torch.sort(ref, dim=0)
             torch.testing.assert_close(actual, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "world_size,num_tokens,top_k,num_experts",
+    [
+        (2, 64, 1, 2),
+        (4, 16, 22, 512),
+    ],
+)
+def test_dispatch_fuses_expert_id_sanitization(
+    world_size, num_tokens, top_k, num_experts
+):
+    torch.cuda.set_device(0)
+    check_sufficient_sm_count(num_tokens, world_size)
+
+    token_selected_experts = torch.randint(
+        0,
+        num_experts,
+        (num_tokens * world_size, top_k),
+        dtype=torch.int32,
+        device=torch.device("cuda"),
+    )
+    expert_id_payload = (
+        torch.arange(
+            num_tokens * world_size, dtype=torch.int32, device=torch.device("cuda")
+        )
+        .view(-1, 1)
+        .expand(-1, top_k)
+        .contiguous()
+    )
+    invalid_expert_id = -3
+    output_tensors, _, _, _ = dispatch_from_single_rank(
+        [expert_id_payload],
+        token_selected_experts,
+        world_size,
+        num_experts,
+        num_tokens,
+        invalid_expert_id=invalid_expert_id,
+        expert_id_payload_index=0,
+    )
+
+    for target_rank, (recv_expert_ids,) in enumerate(output_tensors):
+        for source_rank in range(world_size):
+            source_experts = token_selected_experts[
+                source_rank * num_tokens : (source_rank + 1) * num_tokens
+            ]
+            source_targets = source_experts // (num_experts // world_size)
+            selected = (source_targets == target_rank).any(dim=1)
+            expected_ids = expert_id_payload[
+                source_rank * num_tokens : (source_rank + 1) * num_tokens
+            ][selected, 0]
+            send_count = expected_ids.numel()
+            actual_ids = recv_expert_ids[source_rank, :send_count, 0]
+            torch.testing.assert_close(
+                actual_ids.sort().values, expected_ids.sort().values, atol=0, rtol=0
+            )
+            assert torch.all(
+                recv_expert_ids[source_rank, :send_count] == actual_ids.view(-1, 1)
+            )
+            assert torch.all(
+                recv_expert_ids[source_rank, send_count:] == invalid_expert_id
+            )
 
 
 @pytest.mark.parametrize("world_size,num_tokens", SANITIZE_PARAMS)

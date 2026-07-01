@@ -55,6 +55,10 @@ struct DispatchKernelPointers {
   // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
   int* topk_target_ranks;  // target rank per k, -1 for duplicates
   int* topk_send_indices;  // dst index per k, -1 for duplicates
+
+  // Optional expert-ID tail sanitization fused into dispatch completion.
+  int expert_id_payload_index;  // -1 disables sanitization
+  int32_t invalid_expert_id;
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -96,6 +100,8 @@ struct MoeA2ADispatchParams {
   // Generic payloads
   int num_payloads;                          // Number of different payload types
   PayloadDescriptor payloads[kMaxPayloads];  // Array of payload descriptors
+  int expert_id_payload_index;               // -1 disables fused invalid-tail sanitization
+  int32_t invalid_expert_id;                 // Fill value for invalid expert-ID slots
 
   // Local aux data
   uint32_t* flag_val;        // The value of the flag for this round (stored on the local rank)

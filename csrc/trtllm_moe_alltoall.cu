@@ -119,7 +119,7 @@ Tensor moeA2AInitializeOp(TensorView workspace, int64_t epRank, int64_t epSize,
 Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
-    int64_t topK, int64_t numExperts) {
+    int64_t topK, int64_t numExperts, int64_t invalidExpertId, int64_t expertIdPayloadIndex) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -160,6 +160,11 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   TVM_FFI_ICHECK(numExperts >= epSize && numExperts % epSize == 0)
       << "num_experts must be divisible by ep_size";
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
+  TVM_FFI_ICHECK(expertIdPayloadIndex >= -1 && expertIdPayloadIndex < numPayloads)
+      << "expert_id_payload_index out of range";
+  if (expertIdPayloadIndex >= 0) {
+    CHECK_INPUT_TYPE(inputPayloads[expertIdPayloadIndex], dl_int32);
+  }
 
   // Calculate payload descriptors and sizes from input tensors
   std::vector<PayloadDescriptor> payloadDescriptors(numPayloads);
@@ -206,6 +211,8 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchOp(
   params.token_selected_experts = static_cast<int32_t const*>(tokenSelectedExperts.data_ptr());
   params.num_payloads = numPayloads;
   std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), params.payloads);
+  params.expert_id_payload_index = static_cast<int>(expertIdPayloadIndex);
+  params.invalid_expert_id = static_cast<int32_t>(invalidExpertId);
 
   params.flag_val =
       reinterpret_cast<uint32_t*>(rankWorkspacePtr + offsets[fi_throughput::FLAG_VAL_OFFSET_INDEX]);
