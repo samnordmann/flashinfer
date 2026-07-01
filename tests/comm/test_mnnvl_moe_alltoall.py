@@ -566,6 +566,12 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         all_num_tokens = torch.randint(1, 100, (world_size,)).tolist()
     elif distribution == "uniform":
         all_num_tokens = [50] * world_size
+    elif distribution == "asymmetric_with_empty":
+        # Exercise finalization when one rank has no local token work while peers have different
+        # amounts of work. This requires a multi-rank MNNVL run.
+        if world_size < 2:
+            pytest.skip("asymmetric_with_empty requires at least two ranks")
+        all_num_tokens = [0] + [17 + rank for rank in range(1, world_size)]
     else:
         pytest.skip(f"Invalid distribution: {distribution}")
 
@@ -647,6 +653,7 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         ("uniform", 2),  # topk=2 with uniform distribution
         ("random", 8),  # topk=8 with random distribution
         ("uniform", 8),  # topk=8 with uniform distribution
+        ("asymmetric_with_empty", 22),  # target top-k and zero-token participation
     ],
 )
 def test_moe_a2a_dispatch(distribution, top_k):

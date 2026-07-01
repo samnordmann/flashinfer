@@ -310,15 +310,13 @@ __global__ void moeA2ADispatchKernel(
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
-    int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+    int local_num_tokens, int rank_id, int num_experts_per_rank) {
   int thread_idx = ThreadingPolicy::offset();
   int local_token_idx = ThreadingPolicy::token_idx();
 
   if (local_num_tokens == 0) {
-    // Special case: If local_num_tokens == 0,
-    // we need to keep the threads where local_token_idx == 0 alive to participate in the
-    // synchronization. Other threads should return.
-    if (local_token_idx > 0) return;
+    // Cross-rank completion is handled by the finalizer kernel even when this rank has no work.
+    return;
   } else {
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
@@ -392,79 +390,67 @@ __global__ void moeA2ADispatchKernel(
 
     ThreadingPolicy::sync();
   }
+}
 
-  bool is_first_warp = threadIdx.x / warpSize == 0;
-  if (is_first_warp) {
-    int lane_id = threadIdx.x % warpSize;
-
-    bool is_last_token = false;
-    if (lane_id == 0) {
-      if (local_num_tokens != 0) {
-        int cnt = atomicAdd(ptrs.local_token_counter, 1);
-        is_last_token = cnt + 1 == local_num_tokens;
-      } else {
-        is_last_token = true;
-      }
-    }
-    is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
-
-    if (is_last_token) {
-// Store send_counters to recv_counters
+// This kernel is ordered after the dispatch kernel on the same stream, so every local payload and
+// routing write is complete before the existing cross-rank publication protocol begins.
+__global__ void moeA2ADispatchFinalizeKernel(DispatchKernelPointers ptrs, int rank_id,
+                                             int ep_size) {
+  int lane_id = threadIdx.x;
+  // Store send_counters to recv_counters
 #pragma unroll 1  // No unroll as one iter is typically enough
-      for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
-        int send_count = ptrs.send_counters[target_rank];
-        ptrs.recv_counters[target_rank][rank_id] = send_count;
-      }
+  for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
+    int send_count = ptrs.send_counters[target_rank];
+    ptrs.recv_counters[target_rank][rank_id] = send_count;
+  }
 
 #if !DISABLE_SYNC_FOR_PROFILING
-      uint32_t expected_value = *ptrs.flag_val;
+  uint32_t expected_value = *ptrs.flag_val;
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-      asm volatile("fence.release.sys;");
+  asm volatile("fence.release.sys;");
 #else
-      __threadfence_system();
+  __threadfence_system();
 #endif
 #pragma unroll 1  // No unroll as one iter is typically enough
-      for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
-        uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
-        asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+  for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
+    uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
+    asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
 #if ENABLE_DEBUG_PRINT
-        printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id,
-               expected_value, target_rank);
+    printf("dispatch: +++Rank %d setting completion flag to %d for rank %d\n", rank_id,
+           expected_value, target_rank);
 #endif
-      }
+  }
 
 #pragma unroll 1  // No unroll
-      for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
-        bool flag_set = false;
-        [[maybe_unused]] auto s = clock64();
-        do {
-          uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
-          uint32_t flag_value;
-          // Acquire load to ensure visibility of peer's release-store
-          asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+  for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
+    bool flag_set = false;
+    [[maybe_unused]] auto s = clock64();
+    do {
+      uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+      uint32_t flag_value;
+      // Acquire load to ensure visibility of peer's release-store
+      asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
 #if ENABLE_DEBUG_PRINT
-          printf(
-              "dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, "
-              "expected_value: "
-              "%d, address: %p\n",
-              rank_id, peer_rank, flag_value, expected_value, flag_ptr);
+      printf(
+          "dispatch: ---Rank %d received completion flag from rank %d, flag_value: %d, "
+          "expected_value: "
+          "%d, address: %p\n",
+          rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
-          flag_set = flag_value == expected_value;
-        } while (!flag_set && !check_timeout(s));
+      flag_set = flag_value == expected_value;
+    } while (!flag_set && !check_timeout(s));
 
-        if (__builtin_expect(!flag_set, 0)) {
-          printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n",
-                 rank_id, peer_rank);
-          asm volatile("trap;");
-          return;
-        }
-      }
-      // asm volatile("fence.acquire.sys;");
-#endif
+    if (__builtin_expect(!flag_set, 0)) {
+      printf("dispatch: ---Rank %d timed out waiting for completion flag from rank %d\n", rank_id,
+             peer_rank);
+      asm volatile("trap;");
+      return;
     }
   }
+  // asm volatile("fence.acquire.sys;");
+#endif
 }
 
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
@@ -531,7 +517,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                  <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
                      params.token_selected_experts, kernel_ptrs, params.num_payloads,
                      params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+                     params.num_experts_per_rank))
   } else {
     int grid_size = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
     // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
@@ -545,8 +531,11 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                  <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
                      params.token_selected_experts, kernel_ptrs, params.num_payloads,
                      params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                     params.ep_size, params.num_experts_per_rank))
+                     params.num_experts_per_rank))
   }
+
+  moeA2ADispatchFinalizeKernel<<<1, kWarpSize, 0, params.stream>>>(kernel_ptrs, params.ep_rank,
+                                                                   params.ep_size);
 }
 
 // ============================================================================

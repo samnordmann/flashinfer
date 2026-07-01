@@ -50,7 +50,7 @@ struct DispatchKernelPointers {
   int* send_counters;             // [ep_size] How many tokens have been sent to each target rank
   int* recv_counters[kMaxRanks];  // How many tokens have been received from each source rank. Each
                                   // rank has [ep_size] counters
-  int* local_token_counter;       // Atomic counter for completed tokens
+  int* local_token_counter;       // Reserved workspace counter; not used by the split finalizer
 
   // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
   int* topk_target_ranks;  // target rank per k, -1 for duplicates
@@ -99,7 +99,7 @@ struct MoeA2ADispatchParams {
 
   // Local aux data
   uint32_t* flag_val;        // The value of the flag for this round (stored on the local rank)
-  int* local_token_counter;  // Atomic counter for completed tokens on this rank
+  int* local_token_counter;  // Reserved workspace counter, retained for workspace/API compatibility
   int* send_counters;        // [ep_size] atomic counters - tracks tokens sent to each target rank
   int* topk_target_ranks;    // Top-K compact routing info per local token (size: [local_num_tokens,
                              // top_k]), target rank per k, -1 for duplicates
