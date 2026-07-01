@@ -52,9 +52,10 @@ struct DispatchKernelPointers {
                                   // rank has [ep_size] counters
   int* local_token_counter;       // Atomic counter for completed tokens
 
-  // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-  int* topk_target_ranks;  // target rank per k, -1 for duplicates
-  int* topk_send_indices;  // dst index per k, -1 for duplicates
+  // Dense unique-rank routing per local token, stored with top_k stride. Valid entries precede -1
+  // padding up to the kernel's destination capacity; entries beyond that capacity are unspecified.
+  int* topk_target_ranks;
+  int* topk_send_indices;
 };
 
 // Combine kernel pointers - non-const output in src_data_ptrs[0], const recv buffers
@@ -69,9 +70,9 @@ struct CombineKernelPointers {
                                     // then source rank has signaled the target rank
   uint32_t* flag_val;  // The value of the flag for this round (stored on the local rank)
 
-  // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-  int const* topk_target_ranks;  // target rank per k, -1 for duplicates
-  int const* topk_send_indices;  // dst index per k, -1 for duplicates
+  // Dense unique-rank routing per local token, stored with top_k stride.
+  int const* topk_target_ranks;
+  int const* topk_send_indices;
 };
 
 // Dispatch phase parameters
@@ -101,10 +102,8 @@ struct MoeA2ADispatchParams {
   uint32_t* flag_val;        // The value of the flag for this round (stored on the local rank)
   int* local_token_counter;  // Atomic counter for completed tokens on this rank
   int* send_counters;        // [ep_size] atomic counters - tracks tokens sent to each target rank
-  int* topk_target_ranks;    // Top-K compact routing info per local token (size: [local_num_tokens,
-                             // top_k]), target rank per k, -1 for duplicates
-  int* topk_send_indices;    // Top-K compact routing info per local token (size: [local_num_tokens,
-                             // top_k]), dst index per k, -1 for duplicates
+  int* topk_target_ranks;    // Dense unique target ranks, stored with top_k stride
+  int* topk_send_indices;    // Reserved destination slots paired with topk_target_ranks
 
   // Distributed aux data and recv buffers
   int* recv_counters[kMaxRanks];  // tracks tokens received from each source rank. Each rank has
@@ -148,10 +147,8 @@ struct MoeA2ACombineParams {
 
   // Local aux data
   uint32_t* flag_val;        // The value of the flag for this round (stored on the local rank)
-  int* topk_target_ranks;    // Top-K compact routing info per local token (size: [local_num_tokens,
-                             // top_k]), target rank per k, -1 for duplicates
-  int* topk_send_indices;    // Top-K compact routing info per local token (size: [local_num_tokens,
-                             // top_k]), dst index per k, -1 for duplicates
+  int* topk_target_ranks;    // Dense unique target ranks, stored with top_k stride
+  int* topk_send_indices;    // Reserved destination slots paired with topk_target_ranks
   int const* recv_counters;  // [ep_size] number of valid tokens per source rank for this target
 
   // Distributed aux data and recv buffers

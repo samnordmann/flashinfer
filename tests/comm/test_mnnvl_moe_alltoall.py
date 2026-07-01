@@ -447,7 +447,8 @@ def verify_dispatch(
                 "recv_tensor.dtype should be payload.dtype"
             )
 
-        # Verify counters and compact routing tensors
+        # Verify counters and compact routing tensors. Storage retains top_k stride, while only
+        # min(top_k, ep_size) entries per token are part of the route contract.
         send_counters = all_send_counters[send_rank]
         assert len(send_counters.shape) == 1, "send_counters should be a 1D tensor"
         assert send_counters.shape[0] == ep_size
@@ -514,24 +515,23 @@ def verify_dispatch(
         for token_idx in range(local_num_tokens):
             experts = token_selected_experts[token_idx]
             target_ranks = compute_target_rank_id(experts, num_experts_per_rank)
-            # Deduplicate target ranks per token
-            topk_target_ranks_ref = target_ranks.clone()
-            seen = set()
-            for kk in range(top_k):
-                tr = int(topk_target_ranks_ref[kk].item())
-                if tr in seen:
-                    topk_target_ranks_ref[kk] = -1
-                else:
-                    seen.add(tr)
-
-            assert (
-                topk_target_ranks[token_idx, :].tolist()
-                == topk_target_ranks_ref.tolist()
+            route_capacity = min(top_k, ep_size)
+            compact_target_ranks_ref = []
+            for target_rank in target_ranks.tolist():
+                if target_rank not in compact_target_ranks_ref:
+                    compact_target_ranks_ref.append(target_rank)
+            compact_target_ranks_ref.extend(
+                [-1] * (route_capacity - len(compact_target_ranks_ref))
             )
 
-            for k in range(top_k):
-                dst_pos = topk_send_indices[token_idx, k].item()
-                target_rank = topk_target_ranks[token_idx, k].item()
+            assert (
+                topk_target_ranks[token_idx, :route_capacity].tolist()
+                == compact_target_ranks_ref
+            )
+
+            for route_idx in range(route_capacity):
+                dst_pos = topk_send_indices[token_idx, route_idx].item()
+                target_rank = topk_target_ranks[token_idx, route_idx].item()
                 if dst_pos == -1:
                     assert target_rank == -1
                     continue
@@ -647,6 +647,7 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
         ("uniform", 2),  # topk=2 with uniform distribution
         ("random", 8),  # topk=8 with random distribution
         ("uniform", 8),  # topk=8 with uniform distribution
+        ("uniform", 22),  # topk=22 exercises compact routes when EP size is smaller
     ],
 )
 def test_moe_a2a_dispatch(distribution, top_k):
@@ -661,6 +662,9 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
     rank = comm.Get_rank()
     world_size = comm.Get_size()
     ep_size = world_size
+
+    if top_k > ep_size * 8:
+        pytest.skip("top_k exceeds the expert count for this MPI world size")
 
     if distribution == "random":
         torch.manual_seed(0xD5)
@@ -827,6 +831,7 @@ def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
         ("uniform", 2),  # topk=2 with uniform distribution
         ("random", 8),  # topk=8 with random distribution
         ("uniform", 8),  # topk=8 with uniform distribution
+        ("uniform", 22),  # topk=22 exercises compact combine when EP size is smaller
     ],
 )
 def test_moe_a2a_dispatch_moe_combine(distribution, top_k):
