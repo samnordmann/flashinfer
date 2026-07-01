@@ -101,4 +101,7 @@ int getEnvMoeA2ADispatchBlockSize();
 // Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
 int getEnvMoeA2ACombineBlockSize();
 
+// Whether to split MoE A2A combine readiness into a dedicated kernel (default true).
+bool getEnvMoeA2ASplitCombineReadiness();
+
 }  // namespace tensorrt_llm::common

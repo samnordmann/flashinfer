@@ -815,6 +815,62 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
   vectorized_copy<ThreadingPolicy>(dst_ptr, src_ptr, bytes_per_token);
 }
 
+struct CombineReadinessKernelPointers {
+  uint32_t* completion_flags[kMaxRanks];
+  uint32_t* flag_val;
+};
+
+// Publish this rank's completed prepare generation and acquire all peer payloads before the
+// same-stream data kernel starts. One thread owns each peer so readiness cost is independent of
+// the local token count.
+__global__ void moeA2ACombineReadinessKernel(CombineReadinessKernelPointers ptrs, int rank_id,
+                                             int ep_size) {
+  int peer_rank = threadIdx.x;
+  if (peer_rank >= ep_size) return;
+
+  uint32_t expected_value = *ptrs.flag_val;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("fence.release.sys;");
+#else
+  __threadfence_system();
+#endif
+  uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
+  asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
+
+#if ENABLE_DEBUG_PRINT
+  printf("combine readiness: +++Rank %d setting completion flag to %d for rank %d\n", rank_id,
+         expected_value, peer_rank);
+#endif
+
+  bool flag_set = false;
+  [[maybe_unused]] auto s = clock64();
+  do {
+    uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+    uint32_t flag_value;
+    asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+#if ENABLE_DEBUG_PRINT
+    printf(
+        "combine readiness: ---Rank %d received completion flag from rank %d, flag_value: %d, "
+        "expected_value: %d, address: %p\n",
+        rank_id, peer_rank, flag_value, expected_value, flag_ptr);
+#endif
+    flag_set = flag_value == expected_value;
+  } while (!flag_set && !check_timeout(s));
+
+  if (__builtin_expect(!flag_set, 0)) {
+    printf("combine readiness: ---Rank %d timed out waiting for completion flag from rank %d\n",
+           rank_id, peer_rank);
+    asm volatile("trap;");
+    return;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("fence.acquire.sys;");
+#else
+  __threadfence_system();
+#endif
+}
+
 // ============================================================================
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
@@ -904,6 +960,18 @@ __global__ void moeA2ACombineKernel(
                                                 max_tokens_per_rank, ptrs);
 }
 
+template <typename T, typename ThreadingPolicy, int TOP_K>
+__global__ void moeA2ACombineDataKernel(const CombineKernelPointers ptrs, int max_tokens_per_rank,
+                                        int elements_per_token, int local_num_tokens, int rank_id) {
+  int local_token_idx = ThreadingPolicy::token_idx();
+  if (local_token_idx >= local_num_tokens) return;
+
+  int const size_per_token = elements_per_token * sizeof(T);
+  T* token_output = static_cast<T*>(ptrs.src_data_ptrs[0]) + local_token_idx * elements_per_token;
+  vectorized_combine<TOP_K, ThreadingPolicy, T>(token_output, size_per_token, rank_id,
+                                                max_tokens_per_rank, ptrs);
+}
+
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   constexpr int kBlockSize = 256;
   constexpr int kWarpsPerBlock = kBlockSize / 32;  // 8 warps per block
@@ -960,8 +1028,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   int const kWarpsPerBlock = kBlockSize / 32;  // warpSize
   int grid_size_warp = ceilDiv(params.local_num_tokens, kWarpsPerBlock);
   int grid_size_block = params.local_num_tokens;
-  // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
-  // synchronization.
+  // Keep a valid no-op data launch for zero-token ranks. Readiness participation is handled by
+  // the dedicated CTA in split mode and by this launch in legacy mode.
   if (grid_size_warp == 0) {
     grid_size_warp = 1;
   }
@@ -990,19 +1058,41 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
+  bool const split_readiness = tensorrt_llm::common::getEnvMoeA2ASplitCombineReadiness();
+#if !DISABLE_SYNC_FOR_PROFILING
+  if (split_readiness) {
+    CombineReadinessKernelPointers readiness_ptrs = {};
+    for (int rank = 0; rank < params.ep_size; ++rank) {
+      readiness_ptrs.completion_flags[rank] = params.completion_flags[rank];
+    }
+    readiness_ptrs.flag_val = params.flag_val;
+    moeA2ACombineReadinessKernel<<<1, kMaxRanks, 0, params.stream>>>(readiness_ptrs, params.ep_rank,
+                                                                     params.ep_size);
+  }
+#endif
+
   // Launch appropriate kernel with compact macros
-  SWITCH_DTYPE(params.dtype, TKernelType, {
-    SWITCH_POLICY(params.one_block_per_token, Policy, {
-      SWITCH_TOP_K(params.top_k, TOP_K, {
-        auto launch = [&](int grid_blocks, int block_threads) {
-          moeA2ACombineKernel<TKernelType, Policy, TOP_K>
-              <<<grid_blocks, block_threads, 0, params.stream>>>(
-                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                  params.local_num_tokens, params.ep_rank, params.ep_size);
-        };
-        int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
-        int cta = kBlockSize;
-        launch(grid, cta);
+  SWITCH_BOOL(split_readiness, SPLIT_READINESS, {
+    SWITCH_DTYPE(params.dtype, TKernelType, {
+      SWITCH_POLICY(params.one_block_per_token, Policy, {
+        SWITCH_TOP_K(params.top_k, TOP_K, {
+          auto launch = [&](int grid_blocks, int block_threads) {
+            if constexpr (SPLIT_READINESS) {
+              moeA2ACombineDataKernel<TKernelType, Policy, TOP_K>
+                  <<<grid_blocks, block_threads, 0, params.stream>>>(
+                      kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                      params.local_num_tokens, params.ep_rank);
+            } else {
+              moeA2ACombineKernel<TKernelType, Policy, TOP_K>
+                  <<<grid_blocks, block_threads, 0, params.stream>>>(
+                      kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+                      params.local_num_tokens, params.ep_rank, params.ep_size);
+            }
+          };
+          int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
+          int cta = kBlockSize;
+          launch(grid, cta);
+        });
       });
     });
   });

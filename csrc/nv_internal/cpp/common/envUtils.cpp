@@ -354,6 +354,11 @@ int getEnvMoeA2ACombineBlockSize() {
   return kBlock;
 }
 
+bool getEnvMoeA2ASplitCombineReadiness() {
+  static std::optional<int32_t> const val = getIntEnv("TLLM_MOE_A2A_SPLIT_COMBINE_READINESS");
+  return val.value_or(1) != 0;
+}
+
 bool getEnvEplbForceGdrcopy() { return getBoolEnv("TRTLLM_EPLB_FORCE_GDRCOPY"); }
 
 }  // namespace tensorrt_llm::common
