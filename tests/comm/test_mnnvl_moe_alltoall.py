@@ -267,6 +267,7 @@ def run_moe_a2a_dispatch_single_rank(
     num_experts_per_rank,
     hidden_size,
     invalid_token_expert_id,
+    token_selected_experts_override=None,
 ):
     """Worker function for MPI testing."""
     comm = MPI.COMM_WORLD
@@ -304,9 +305,15 @@ def run_moe_a2a_dispatch_single_rank(
     rank_local_tokens = all_num_tokens[rank]
 
     # Generate data using helper functions
-    token_selected_experts = generate_token_selected_experts(
-        rank_local_tokens, ep_size, num_experts_per_rank, top_k
-    )
+    if token_selected_experts_override is None:
+        token_selected_experts = generate_token_selected_experts(
+            rank_local_tokens, ep_size, num_experts_per_rank, top_k
+        )
+    else:
+        token_selected_experts = token_selected_experts_override.to(
+            device="cuda", dtype=torch.int32
+        )
+        assert token_selected_experts.shape == (rank_local_tokens, top_k)
     payloads, expert_id_payload_index = make_nvfp4_payloads(
         rank_local_tokens, hidden_size, top_k, rank, token_selected_experts
     )
@@ -652,6 +659,126 @@ def moe_a2a_dispatch_test_impl(distribution, top_k):
 def test_moe_a2a_dispatch(distribution, top_k):
     """Test MoE A2A dispatch operation."""
     safe_run(moe_a2a_dispatch_test_impl, distribution, top_k)
+
+
+def _make_ep4_topk22_experts(rank, num_experts_per_rank):
+    target_ranks = [
+        0,
+        0,
+        1,
+        1,
+        2,
+        0,
+        3,
+        2,
+        1,
+        3,
+        0,
+        2,
+        1,
+        3,
+        0,
+        2,
+        1,
+        3,
+        0,
+        2,
+        1,
+        3,
+    ]
+    rotation = rank * 3
+    target_ranks = target_ranks[rotation:] + target_ranks[:rotation]
+    target_ranks = [(target_rank + rank) % 4 for target_rank in target_ranks]
+
+    next_local_expert = [0] * 4
+    expert_ids = []
+    for target_rank in target_ranks:
+        expert_ids.append(
+            target_rank * num_experts_per_rank + next_local_expert[target_rank]
+        )
+        next_local_expert[target_rank] += 1
+    return torch.tensor([expert_ids], dtype=torch.int32)
+
+
+def moe_a2a_dispatch_ep4_topk22_metadata_test_impl():
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    ep_size = comm.Get_size()
+    if ep_size != 4:
+        pytest.skip("route compaction metadata test requires EP4")
+
+    try:
+        MnnvlMemory.initialize()
+        if not mnnvl_available():
+            pytest.skip(
+                "MNNVL not supported on this system or container lacks SYS_PTRACE capability"
+            )
+    except Exception:
+        pytest.skip("MNNVL not supported on this system")
+
+    all_num_tokens = [1] * ep_size
+    top_k = 22
+    num_experts_per_rank = 8
+    hidden_size = 1024
+    invalid_token_expert_id = -1
+    token_selected_experts = _make_ep4_topk22_experts(rank, num_experts_per_rank)
+
+    result = run_moe_a2a_dispatch_single_rank(
+        ep_size,
+        all_num_tokens,
+        top_k,
+        num_experts_per_rank,
+        hidden_size,
+        invalid_token_expert_id,
+        token_selected_experts_override=token_selected_experts,
+    )
+    check_any_rank_failed()
+    all_results = comm.allgather(result)
+
+    for source_rank, source_result in enumerate(all_results):
+        source_experts = source_result[0][0]
+        actual_send_indices = source_result[4][0].tolist()
+        actual_target_ranks = source_result[5][0].tolist()
+
+        expected_target_ranks = []
+        expected_send_indices = []
+        seen = set()
+        for expert_id in source_experts.tolist():
+            target_rank = expert_id // num_experts_per_rank
+            if target_rank in seen:
+                expected_target_ranks.append(-1)
+                expected_send_indices.append(-1)
+            else:
+                seen.add(target_rank)
+                expected_target_ranks.append(target_rank)
+                expected_send_indices.append(0)
+
+        assert actual_target_ranks == expected_target_ranks, (
+            f"rank {source_rank} changed the sparse top-k target-rank contract"
+        )
+        assert actual_send_indices == expected_send_indices, (
+            f"rank {source_rank} changed the sparse top-k send-index contract"
+        )
+
+    verify_dispatch(
+        [result[0] for result in all_results],
+        [result[1] for result in all_results],
+        [result[2] for result in all_results],
+        [result[3] for result in all_results],
+        [result[4] for result in all_results],
+        [result[5] for result in all_results],
+        [result[6] for result in all_results],
+        ep_size,
+        all_num_tokens,
+        top_k,
+        num_experts_per_rank,
+        result[7],
+        invalid_token_expert_id,
+    )
+
+
+def test_moe_a2a_dispatch_ep4_topk22_metadata():
+    safe_run(moe_a2a_dispatch_ep4_topk22_metadata_test_impl)
 
 
 def moe_a2a_dispatch_moe_combine_test_impl(distribution, top_k):
