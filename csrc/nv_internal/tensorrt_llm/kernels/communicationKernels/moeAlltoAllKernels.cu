@@ -921,6 +921,9 @@ __global__ void moeA2ACombineKernel(
     for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
       bool flag_set = false;
       [[maybe_unused]] auto s = clock64();
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+      unsigned int sleep_ns = 8;
+#endif
       do {
         uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
         uint32_t flag_value;
@@ -934,6 +937,12 @@ __global__ void moeA2ACombineKernel(
             rank_id, peer_rank, flag_value, expected_value, flag_ptr);
 #endif
         flag_set = flag_value == expected_value;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+        if (!flag_set) {
+          __nanosleep(sleep_ns);
+          if (sleep_ns < 256) sleep_ns *= 2;
+        }
+#endif
       } while (!flag_set && !check_timeout(s));
 
       if (__builtin_expect(!flag_set, 0)) {
