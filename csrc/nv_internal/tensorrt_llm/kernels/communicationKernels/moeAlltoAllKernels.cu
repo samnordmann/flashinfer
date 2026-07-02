@@ -1001,8 +1001,17 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   TLLM_CHECK(params.local_num_tokens >= 0);
   TLLM_CHECK(params.elements_per_token > 0);
 
+  // H8192 has 1024 independent 16-byte segments per BF16 row. For large batches, 128-thread
+  // blocks trade per-token parallelism for a smaller register allocation per CTA and more token
+  // CTAs in flight. Keep 256 threads for low-token latency and every generic shape.
+  bool const use_h8192_large_batch_schedule =
+      params.dtype == nvinfer1::DataType::kBF16 && params.elements_per_token == 8192 &&
+      params.ep_size == 4 && params.top_k == 22 &&
+      params.quant_mode == MoeA2ACombineQuantMode::NONE && params.local_num_tokens > 1024;
+  int const default_block_size = use_h8192_large_batch_schedule ? 128 : 256;
+  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize(default_block_size);
+
   // Configure kernel launch: one block per token
-  int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
   int grid_size_block = params.local_num_tokens;
   // If local_num_tokens is 0, we still need to launch a minimal kernel to participate in the
   // synchronization.
