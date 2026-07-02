@@ -156,6 +156,12 @@ struct MoeA2ADispatchParams {
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
+
+// BF16 -> NVFP4 fused dispatch. The first two payload descriptors describe the generated packed
+// activation and linear E4M3 scale outputs; remaining descriptors are copied as generic payloads.
+void moe_a2a_dispatch_nvfp4_launch(MoeA2ADispatchParams const& params, float const* global_scale,
+                                   int hidden_size);
+
 // Prepare for dispatch: zero send_counters, local_token_counter and increment flag_val
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
