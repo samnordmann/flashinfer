@@ -558,11 +558,13 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
 // Accumulate across all valid ranks into registers, then store once per segment
 template <int VEC_SIZE_BYTES, int TOP_K, typename T,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
-          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
+          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR,
+          bool CacheSourceRows = false>
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
                                         int row_size, int rank_id, int max_tokens_per_rank,
                                         CombineKernelPointers const& ptrs,
-                                        float OutputScalarScale = 1.0f) {
+                                        float OutputScalarScale = 1.0f,
+                                        uint8_t const* const* source_rows = nullptr) {
   constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
   const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
@@ -589,21 +591,31 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
 // Unrolled K accumulation using compact top-k lists
 #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
-      int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-      int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-      if (dst_idx < 0) {
-        acc[k].fill(0);
-        continue;
+      uint8_t const* source_row;
+      if constexpr (CacheSourceRows) {
+        source_row = source_rows[k];
+        if (source_row == nullptr) {
+          acc[k].fill(0);
+          continue;
+        }
+      } else {
+        int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
+        int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
+        if (dst_idx < 0) {
+          acc[k].fill(0);
+          continue;
+        }
+
+        uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+        size_t base_source_rank =
+            static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
+            static_cast<size_t>(dst_idx);
+        size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
+        source_row = recv_buffer + base_token;
       }
 
-      uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
-      size_t base_source_rank =
-          static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
-          static_cast<size_t>(dst_idx);
-      size_t base_token = base_source_rank * static_cast<size_t>(size_per_token);
-
       // Load directly into the per-k accumulator; reduce across k below
-      acc[k].load(recv_buffer + base_token + offset);
+      acc[k].load(source_row + offset);
     }
 
     // Reduce acc[TOP_K] into acc[0]
@@ -878,7 +890,8 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 // ============================================================================
 
 template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
-          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
+          MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR,
+          bool CacheSourceRows = false>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
@@ -893,6 +906,28 @@ __global__ void moeA2ACombineKernel(
   } else {
     // Threads that do not have a token to process should return.
     if (local_token_idx >= local_num_tokens) return;
+  }
+
+  extern __shared__ uint8_t const* source_rows[];
+  if constexpr (CacheSourceRows) {
+    // Use the otherwise-idle second warp while the first warp handles readiness. Original top-k
+    // positions are retained so the reduction tree and its BF16 association remain unchanged.
+    int source_row_idx = static_cast<int>(threadIdx.x) - warpSize;
+    if (local_num_tokens != 0 && source_row_idx >= 0 && source_row_idx < TOP_K) {
+      int route_idx = local_token_idx * TOP_K + source_row_idx;
+      int dst_idx = ptrs.topk_send_indices[route_idx];
+      uint8_t const* source_row = nullptr;
+      if (dst_idx >= 0) {
+        int target_rank = ptrs.topk_target_ranks[route_idx];
+        uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+        size_t source_slot =
+            static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
+            static_cast<size_t>(dst_idx);
+        source_row =
+            recv_buffer + source_slot * static_cast<size_t>(elements_per_token) * sizeof(T);
+      }
+      source_rows[source_row_idx] = source_row;
+    }
   }
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -950,14 +985,24 @@ __global__ void moeA2ACombineKernel(
 #endif
   }
   __syncthreads();
+#else
+  if constexpr (CacheSourceRows) {
+    __syncthreads();
+  }
 #endif
 
   if (local_num_tokens == 0) return;
 
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
-      ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
-      max_tokens_per_rank, ptrs, OutputScalarScale);
+  if constexpr (CacheSourceRows) {
+    vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode, CacheSourceRows>(
+        ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
+        max_tokens_per_rank, ptrs, OutputScalarScale, source_rows);
+  } else {
+    vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
+        ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
+        max_tokens_per_rank, ptrs, OutputScalarScale);
+  }
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -1031,6 +1076,20 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   // Copy communication tracking pointers
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
+
+  // H8192 gives each thread four 16-byte segments at the target 256-thread geometry. Cache each
+  // source row once per CTA so those segments reuse the route-dependent address calculation.
+  if (params.dtype == nvinfer1::DataType::kBF16 && params.top_k == 22 && params.ep_size == 4 &&
+      params.elements_per_token == 8192 && params.quant_mode == MoeA2ACombineQuantMode::NONE &&
+      params.swizzle_mode == MoeA2ACombineSwizzleSFMode::LINEAR && kBlockSize == 256) {
+    constexpr size_t kSourceRowsBytes = 22 * sizeof(uint8_t const*);
+    moeA2ACombineKernel<__nv_bfloat16, 22, MoeA2ACombineQuantMode::NONE,
+                        MoeA2ACombineSwizzleSFMode::LINEAR, true>
+        <<<grid_size_block, kBlockSize, kSourceRowsBytes, params.stream>>>(
+            kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+            params.local_num_tokens, params.ep_rank, params.ep_size, params.output_scalar_scale);
+    return;
+  }
 
   // Launch appropriate kernel with compact macros
   SWITCH_DTYPE(params.dtype, TKernelType, {
