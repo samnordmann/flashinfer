@@ -242,8 +242,8 @@ template <int VEC_SIZE, int TOP_K>
 __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_token, int rank_id,
                                          int max_tokens_per_rank, int payload_idx,
                                          DispatchKernelPointers const& ptrs,
-                                         int const* topk_target_ranks,
-                                         int const* topk_send_indices) {
+                                         int const* topk_target_ranks, int const* topk_send_indices,
+                                         int worker_idx, int num_workers) {
   using flashinfer::vec_t;
 
   // Precompute destination base pointers per k
@@ -265,8 +265,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 
   // TODO: process all payloads. index could be reused.
-  int const stride = blockDim.x * VEC_SIZE;
-  for (int offset = threadIdx.x * VEC_SIZE; offset < bytes_per_token; offset += stride) {
+  int const stride = num_workers * VEC_SIZE;
+  for (int offset = worker_idx * VEC_SIZE; offset < bytes_per_token; offset += stride) {
     vec_t<uint8_t, VEC_SIZE> v;
     v.load(src_ptr + offset);
 
@@ -288,21 +288,34 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
                                     int const* topk_target_ranks, int const* topk_send_indices) {
   if (bytes_per_token % 16 == 0) {
     vectorized_dispatch_impl<16, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                        payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                        threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 8 == 0) {
     vectorized_dispatch_impl<8, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 4 == 0) {
     vectorized_dispatch_impl<4, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else if (bytes_per_token % 2 == 0) {
     vectorized_dispatch_impl<2, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   } else {
     vectorized_dispatch_impl<1, TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+                                       payload_idx, ptrs, topk_target_ranks, topk_send_indices,
+                                       threadIdx.x, blockDim.x);
   }
 }
+
+constexpr int kH8192Nvfp4ActivationBytes = 4096;
+constexpr int kH8192Nvfp4ScaleBytes = 512;
+constexpr int kH8192Nvfp4TopKBytes = 88;
+constexpr int kH8192Nvfp4TopKVectorBytes = 8;
+constexpr int kH8192Nvfp4TopKVectors = kH8192Nvfp4TopKBytes / kH8192Nvfp4TopKVectorBytes;
+static_assert(kH8192Nvfp4TopKBytes % kH8192Nvfp4TopKVectorBytes == 0);
+static_assert(2 * kH8192Nvfp4TopKVectors <= 32);
 
 __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter,
                                             int ep_size, uint32_t* flag_val_ptr) {
@@ -327,13 +340,15 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // - Better GPU utilization and reduced synchronization overhead
 // ============================================================================
 
-template <int TOP_K>
+template <int TOP_K, bool PHASE_H8192_NVFP4_PAYLOADS = false>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,      // Struct containing all kernel pointers
     int num_payloads,                       // Number of payloads
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts_per_rank) {
+  static_assert(!PHASE_H8192_NVFP4_PAYLOADS || TOP_K == 22);
+
   int thread_idx = threadIdx.x;
   int local_token_idx = blockIdx.x;
 
@@ -393,14 +408,46 @@ __global__ void moeA2ADispatchKernel(
       topk_send_indices[k] = smem_topk_send_indices[k];
     }
 
-    // Perform a single source load and TOP_K fanout per payload
-    for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
-      uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
-      int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
-      uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+    if constexpr (PHASE_H8192_NVFP4_PAYLOADS) {
+      // The 4,096-byte activation row maps exactly to this path's 256 threads at 16 B/thread.
+      // Once it is issued, one warp handles the 512-byte scales and a second maps the two
+      // eleven-vector 88-byte tails to lanes 0-10 and 11-21.
+      auto const* activation_src =
+          static_cast<uint8_t const*>(ptrs.src_data_ptrs[0]) +
+          static_cast<size_t>(local_token_idx) * kH8192Nvfp4ActivationBytes;
+      vectorized_dispatch_impl<16, TOP_K>(activation_src, kH8192Nvfp4ActivationBytes, rank_id,
+                                          max_tokens_per_rank, 0, ptrs, topk_target_ranks,
+                                          topk_send_indices, thread_idx, blockDim.x);
 
-      vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
-                                 payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+      int const warp_id = thread_idx / warpSize;
+      int const lane_id = thread_idx % warpSize;
+      if (warp_id == 0) {
+        auto const* scale_src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[1]) +
+                                static_cast<size_t>(local_token_idx) * kH8192Nvfp4ScaleBytes;
+        vectorized_dispatch_impl<16, TOP_K>(scale_src, kH8192Nvfp4ScaleBytes, rank_id,
+                                            max_tokens_per_rank, 1, ptrs, topk_target_ranks,
+                                            topk_send_indices, lane_id, warpSize);
+      } else if (warp_id == 1 && lane_id < 2 * kH8192Nvfp4TopKVectors) {
+        bool const second_topk_payload = lane_id >= kH8192Nvfp4TopKVectors;
+        int const payload_idx = second_topk_payload ? 3 : 2;
+        int const payload_worker_idx =
+            second_topk_payload ? lane_id - kH8192Nvfp4TopKVectors : lane_id;
+        auto const* topk_src = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]) +
+                               static_cast<size_t>(local_token_idx) * kH8192Nvfp4TopKBytes;
+        vectorized_dispatch_impl<kH8192Nvfp4TopKVectorBytes, TOP_K>(
+            topk_src, kH8192Nvfp4TopKBytes, rank_id, max_tokens_per_rank, payload_idx, ptrs,
+            topk_target_ranks, topk_send_indices, payload_worker_idx, kH8192Nvfp4TopKVectors);
+      }
+    } else {
+      // Perform a single source load and TOP_K fanout per payload.
+      for (int payload_idx = 0; payload_idx < num_payloads; payload_idx++) {
+        uint8_t const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+        int bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+        uint8_t const* src_ptr = src_data + local_token_idx * bytes_per_token;
+
+        vectorized_dispatch<TOP_K>(src_ptr, bytes_per_token, rank_id, max_tokens_per_rank,
+                                   payload_idx, ptrs, topk_target_ranks, topk_send_indices);
+      }
     }
 
     __syncthreads();
@@ -485,6 +532,25 @@ void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
       params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
 }
 
+static bool use_h8192_nvfp4_payload_phases(MoeA2ADispatchParams const& params, int block_size) {
+  // Keep this gate exact: the specialized kernel assigns payloads 1-3 to fixed warps and vector
+  // widths. Any other payload order, model shape, or launch geometry uses the generic kernel.
+  if (block_size != 256 || params.ep_size != 4 || params.num_experts_per_rank != 128 ||
+      params.top_k != 22 || params.num_payloads != 4) {
+    return false;
+  }
+
+  constexpr int expected_bytes[] = {kH8192Nvfp4ActivationBytes, kH8192Nvfp4ScaleBytes,
+                                    kH8192Nvfp4TopKBytes, kH8192Nvfp4TopKBytes};
+  for (int payload_idx = 0; payload_idx < params.num_payloads; ++payload_idx) {
+    auto const& payload = params.payloads[payload_idx];
+    if (payload.element_size * payload.elements_per_token != expected_bytes[payload_idx]) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // ============================================================================
 // Launch Functions
 // ============================================================================
@@ -536,11 +602,18 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
     grid_size = 1;
   }
   int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-  SWITCH_TOP_K(params.top_k, TOP_K,
-               moeA2ADispatchKernel<TOP_K><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
-                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                   params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                   params.ep_size, params.num_experts_per_rank))
+  if (use_h8192_nvfp4_payload_phases(params, kBlockSize)) {
+    moeA2ADispatchKernel<22, true><<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+        params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
+        params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts_per_rank);
+  } else {
+    SWITCH_TOP_K(params.top_k, TOP_K,
+                 moeA2ADispatchKernel<TOP_K>
+                 <<<grid_size, kBlockSize, shared_bytes, params.stream>>>(
+                     params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                     params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                     params.ep_size, params.num_experts_per_rank))
+  }
 }
 
 // ============================================================================
