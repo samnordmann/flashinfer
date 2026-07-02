@@ -54,6 +54,9 @@ from .allreduce import (
 from .trtllm_moe_alltoall import MoeAlltoAll as MoeAlltoAll
 from .trtllm_moe_alltoall import moe_a2a_combine as moe_a2a_combine
 from .trtllm_moe_alltoall import moe_a2a_dispatch as moe_a2a_dispatch
+from .trtllm_moe_alltoall import (
+    moe_a2a_dispatch_nvfp4 as moe_a2a_dispatch_nvfp4,
+)
 from .trtllm_moe_alltoall import moe_a2a_initialize as moe_a2a_initialize
 from .trtllm_moe_alltoall import (
     moe_a2a_get_workspace_size_per_rank as moe_a2a_get_workspace_size_per_rank,

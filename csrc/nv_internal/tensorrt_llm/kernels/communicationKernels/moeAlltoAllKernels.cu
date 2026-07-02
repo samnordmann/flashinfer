@@ -480,6 +480,167 @@ __global__ void moeA2ADispatchKernel(
   }
 }
 
+// Specialized BF16 -> NVFP4 dispatch. This path is intentionally separate from generic payload
+// dispatch: it quantizes each 16-value activation block once and fans the packed value and scale
+// directly into the destination workspaces. Global top-k metadata retains the generic sparse
+// layout so combine observes the same reduction order.
+template <int TOP_K, bool DISABLE_FP4_QUANT_FAST_MATH>
+__global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
+                                          DispatchKernelPointers const ptrs, int num_payloads,
+                                          int max_tokens_per_rank, int local_num_tokens,
+                                          int rank_id, int ep_size, int num_experts_per_rank,
+                                          float const* global_scale, int hidden_size) {
+  int const local_token_idx = blockIdx.x;
+
+  if (local_num_tokens == 0) {
+    if (local_token_idx > 0) return;
+  } else {
+    if (local_token_idx >= local_num_tokens) return;
+
+    // Only the fused path uses this compact shared route. The persistent global metadata below
+    // remains TOP_K-wide and bitwise compatible with generic dispatch/combine.
+    extern __shared__ int smem[];
+    int* compact_target_ranks = smem;
+    int* compact_send_indices = smem + TOP_K;
+    int* compact_count = smem + 2 * TOP_K;
+
+    if (threadIdx.x == 0) {
+      uint64_t already_copied = 0;
+      int count = 0;
+#pragma unroll 1
+      for (int k = 0; k < TOP_K; ++k) {
+        int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+        int const target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+        int const metadata_idx = local_token_idx * TOP_K + k;
+
+        if (already_copied & (1ULL << target_rank)) {
+          ptrs.topk_target_ranks[metadata_idx] = -1;
+          ptrs.topk_send_indices[metadata_idx] = -1;
+          continue;
+        }
+
+        int const dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+        ptrs.topk_target_ranks[metadata_idx] = target_rank;
+        ptrs.topk_send_indices[metadata_idx] = dst_token_idx;
+        compact_target_ranks[count] = target_rank;
+        compact_send_indices[count] = dst_token_idx;
+        ++count;
+        already_copied |= 1ULL << target_rank;
+      }
+      *compact_count = count;
+    }
+    __syncthreads();
+
+    int const destination_count = *compact_count;
+    int const scale_factors_per_token = hidden_size / 16;
+    int const packed_bytes_per_token = hidden_size / 2;
+    auto const* hidden_states = static_cast<__nv_bfloat16 const*>(ptrs.src_data_ptrs[0]);
+    float const sf_scale = __ldg(global_scale);
+
+    for (int sf_idx = threadIdx.x; sf_idx < scale_factors_per_token; sf_idx += blockDim.x) {
+      flashinfer::vec_t<__nv_bfloat16, 16> input_vec;
+      input_vec.load(hidden_states + static_cast<size_t>(local_token_idx) * hidden_size +
+                     sf_idx * 16);
+      auto& packed_vec =
+          reinterpret_cast<tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 16>&>(input_vec);
+      uint8_t block_scale;
+      uint64_t const packed_fp4 =
+          tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 16, false,
+                                                      DISABLE_FP4_QUANT_FAST_MATH>(
+              packed_vec, sf_scale, &block_scale);
+
+#pragma unroll 1
+      for (int destination_idx = 0; destination_idx < destination_count; ++destination_idx) {
+        int const target_rank = compact_target_ranks[destination_idx];
+        int const dst_token_idx = compact_send_indices[destination_idx];
+        size_t const slot = static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_token_idx;
+
+        auto* packed_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][0]) +
+                           slot * packed_bytes_per_token + sf_idx * sizeof(uint64_t);
+        *reinterpret_cast<uint64_t*>(packed_dst) = packed_fp4;
+
+        auto* scale_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][1]) +
+                          slot * scale_factors_per_token + sf_idx;
+        *scale_dst = block_scale;
+      }
+    }
+
+    // Payloads after the generated activation and scale tensors retain generic byte-copy
+    // semantics. They are small routing payloads on the target path, so copying once per unique
+    // destination avoids per-thread TOP_K pointer arrays and their register pressure.
+    for (int payload_idx = 2; payload_idx < num_payloads; ++payload_idx) {
+      auto const* src_data = static_cast<uint8_t const*>(ptrs.src_data_ptrs[payload_idx]);
+      int const bytes_per_token = ptrs.payload_bytes_per_token[payload_idx];
+      auto const* src_ptr = src_data + static_cast<size_t>(local_token_idx) * bytes_per_token;
+#pragma unroll 1
+      for (int destination_idx = 0; destination_idx < destination_count; ++destination_idx) {
+        int const target_rank = compact_target_ranks[destination_idx];
+        int const dst_token_idx = compact_send_indices[destination_idx];
+        size_t const slot = static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_token_idx;
+        auto* dst_data = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][payload_idx]);
+        vectorized_copy(dst_data + slot * bytes_per_token, src_ptr, bytes_per_token);
+      }
+    }
+    __syncthreads();
+  }
+
+  bool const is_first_warp = threadIdx.x / warpSize == 0;
+  if (is_first_warp) {
+    int const lane_id = threadIdx.x % warpSize;
+    bool is_last_token = false;
+    if (lane_id == 0) {
+      if (local_num_tokens != 0) {
+        int const count = atomicAdd(ptrs.local_token_counter, 1);
+        is_last_token = count + 1 == local_num_tokens;
+      } else {
+        is_last_token = true;
+      }
+    }
+    is_last_token = __shfl_sync(0xffffffff, is_last_token, 0);
+
+    if (is_last_token) {
+#pragma unroll 1
+      for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
+        int const send_count = ptrs.send_counters[target_rank];
+        ptrs.recv_counters[target_rank][rank_id] = send_count;
+      }
+
+#if !DISABLE_SYNC_FOR_PROFILING
+      uint32_t const expected_value = *ptrs.flag_val;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      asm volatile("fence.release.sys;");
+#else
+      __threadfence_system();
+#endif
+#pragma unroll 1
+      for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize) {
+        uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
+        asm volatile("st.relaxed.sys.u32 [%0], %1;" : : "l"(flag_addr), "r"(expected_value));
+      }
+
+#pragma unroll 1
+      for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
+        bool flag_set = false;
+        [[maybe_unused]] auto start = clock64();
+        do {
+          uint32_t* flag_ptr = &ptrs.completion_flags[rank_id][peer_rank];
+          uint32_t flag_value;
+          asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(flag_value) : "l"(flag_ptr));
+          flag_set = flag_value == expected_value;
+        } while (!flag_set && !check_timeout(start));
+
+        if (__builtin_expect(!flag_set, 0)) {
+          printf("dispatch_nvfp4: ---Rank %d timed out waiting for completion flag from rank %d\n",
+                 rank_id, peer_rank);
+          asm volatile("trap;");
+          return;
+        }
+      }
+#endif
+    }
+  }
+}
+
 void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params) {
   moeA2APrepareDispatchKernel<<<1, params.ep_size, 0, params.stream>>>(
       params.send_counters, params.local_token_counter, params.ep_size, params.flag_val);
@@ -541,6 +702,53 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                    params.token_selected_experts, kernel_ptrs, params.num_payloads,
                    params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
                    params.ep_size, params.num_experts_per_rank))
+}
+
+void moe_a2a_dispatch_nvfp4_launch(MoeA2ADispatchParams const& params, float const* global_scale,
+                                   int hidden_size) {
+  TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
+  TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+  TLLM_CHECK(params.local_num_tokens >= 0);
+  TLLM_CHECK(params.num_payloads >= 2 && params.num_payloads <= kMaxPayloads);
+  TLLM_CHECK(hidden_size > 0 && hidden_size % 16 == 0);
+  TLLM_CHECK(params.payloads[0].element_size * params.payloads[0].elements_per_token ==
+             hidden_size / 2);
+  TLLM_CHECK(params.payloads[1].element_size * params.payloads[1].elements_per_token ==
+             hidden_size / 16);
+  TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvNVFP4Use4Over6(),
+                       "Fused NVFP4 dispatch does not support FLASHINFER_NVFP4_4OVER6");
+
+  DispatchKernelPointers kernel_ptrs = {};
+  for (int i = 0; i < params.num_payloads; ++i) {
+    kernel_ptrs.src_data_ptrs[i] = params.payloads[i].src_data;
+    kernel_ptrs.payload_bytes_per_token[i] =
+        params.payloads[i].element_size * params.payloads[i].elements_per_token;
+  }
+  for (int target_rank = 0; target_rank < params.ep_size; ++target_rank) {
+    kernel_ptrs.recv_counters[target_rank] = params.recv_counters[target_rank];
+    for (int payload = 0; payload < params.num_payloads; ++payload) {
+      kernel_ptrs.recv_buffers[target_rank][payload] = params.recv_buffers[target_rank][payload];
+    }
+    kernel_ptrs.completion_flags[target_rank] = params.completion_flags[target_rank];
+  }
+  kernel_ptrs.flag_val = params.flag_val;
+  kernel_ptrs.send_counters = params.send_counters;
+  kernel_ptrs.local_token_counter = params.local_token_counter;
+  kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
+  kernel_ptrs.topk_send_indices = params.topk_send_indices;
+
+  int const block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+  int const grid_size = params.local_num_tokens == 0 ? 1 : params.local_num_tokens;
+  int const shared_bytes = (2 * params.top_k + 1) * static_cast<int>(sizeof(int));
+  bool const disable_fast_math = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
+  SWITCH_BOOL(
+      disable_fast_math, DISABLE_FP4_QUANT_FAST_MATH,
+      SWITCH_TOP_K(params.top_k, TOP_K,
+                   moeA2ANvfp4DispatchKernel<TOP_K, DISABLE_FP4_QUANT_FAST_MATH>
+                   <<<grid_size, block_size, shared_bytes, params.stream>>>(
+                       params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                       params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                       params.ep_size, params.num_experts_per_rank, global_scale, hidden_size)))
 }
 
 // ============================================================================
