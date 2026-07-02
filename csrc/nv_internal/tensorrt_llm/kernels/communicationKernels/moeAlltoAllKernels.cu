@@ -581,21 +581,28 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
 
   int const stride = blockDim.x * VEC_SIZE_BYTES;
   int const local_token_idx = blockIdx.x;
+  int const topk_offset = local_token_idx * TOP_K;
+
+  static_assert(TOP_K <= 32, "TOP_K must fit in one warp");
+  int const lane_id = threadIdx.x % warpSize;
+  int const lane_dst_idx = lane_id < TOP_K ? ptrs.topk_send_indices[topk_offset + lane_id] : -1;
+  // Retain original k positions so the sparse reduction tree below keeps its BF16 association.
+  uint32_t const valid_topk_mask = __ballot_sync(0xffffffffU, lane_dst_idx >= 0);
 
   for (int offset = threadIdx.x * VEC_SIZE_BYTES; offset < size_per_token; offset += stride) {
     int logical_offset = offset / sizeof(T);
     vec_t<uint8_t, VEC_SIZE_BYTES> acc[TOP_K];
 
-// Unrolled K accumulation using compact top-k lists
+// Unrolled K accumulation using sparse original top-k positions
 #pragma unroll
     for (int k = 0; k < TOP_K; ++k) {
-      int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
-      int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-      if (dst_idx < 0) {
+      if ((valid_topk_mask & (1U << k)) == 0) {
         acc[k].fill(0);
         continue;
       }
 
+      int target_rank = ptrs.topk_target_ranks[topk_offset + k];
+      int dst_idx = ptrs.topk_send_indices[topk_offset + k];
       uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
       size_t base_source_rank =
           static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
