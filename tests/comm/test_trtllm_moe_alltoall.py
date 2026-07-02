@@ -101,6 +101,22 @@ QUANT_PARAMS = [
 ]
 
 
+# EP4/top-k22 BF16 combine specialization used by Nemotron Ultra NVFP4 experts.
+EP4_TOPK22_COMBINE_PARAMS = [
+    (
+        4,
+        16,
+        8192,
+        22,
+        torch.bfloat16,
+        False,
+        CombineQuantMode.NONE,
+        SfLayout.layout_linear,
+        False,
+    ),
+]
+
+
 LORA_COMBINE_PARAMS = [
     # (world_size, num_tokens, vector_dim, top_k, dtype, payload_in_workspace, quant_mode, sf_layout, use_lora)
     (
@@ -650,6 +666,7 @@ def fake_moe(
 @pytest.mark.parametrize(
     "world_size,num_tokens,vector_dim,top_k,dtype,payload_in_workspace,quant_mode,sf_layout,use_lora",
     [(*x, *y, False) for x, y in itertools.product(COMBINE_PARAMS, QUANT_PARAMS)]
+    + EP4_TOPK22_COMBINE_PARAMS
     + LORA_COMBINE_PARAMS,
 )
 def test_moe_combine_multi_rank_single_gpu(

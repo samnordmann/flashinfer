@@ -547,6 +547,59 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 // Combine kernels
 // ============================================================================
 
+constexpr int kDynamicEpSize = 0;
+constexpr int kEp4Size = 4;
+
+// The EP4 specialization only carries pointers reachable by the target kernel. This avoids
+// dynamically indexing the generic kMaxRanks x kMaxPayloads kernel-argument table.
+struct Ep4CombineKernelPointers {
+  void* src_data_ptrs[1];
+  void* output_scales;
+  void const* recv_buffers[kEp4Size][1];
+  uint32_t* completion_flags[kEp4Size];
+  uint32_t* flag_val;
+  int const* topk_target_ranks;
+  int const* topk_send_indices;
+};
+
+template <int EP_SIZE, typename PointerType>
+class CombineRecvBufferAccessor {
+ public:
+  __device__ __forceinline__ explicit CombineRecvBufferAccessor(PointerType const& ptrs)
+      : ptrs_(ptrs) {}
+
+  __device__ __forceinline__ uint8_t const* get(int target_rank) const {
+    return static_cast<uint8_t const*>(ptrs_.recv_buffers[target_rank][0]);
+  }
+
+ private:
+  PointerType const& ptrs_;
+};
+
+template <typename PointerType>
+class CombineRecvBufferAccessor<kEp4Size, PointerType> {
+ public:
+  __device__ __forceinline__ explicit CombineRecvBufferAccessor(PointerType const& ptrs)
+      : rank0_(static_cast<uint8_t const*>(ptrs.recv_buffers[0][0])),
+        rank1_(static_cast<uint8_t const*>(ptrs.recv_buffers[1][0])),
+        rank2_(static_cast<uint8_t const*>(ptrs.recv_buffers[2][0])),
+        rank3_(static_cast<uint8_t const*>(ptrs.recv_buffers[3][0])) {}
+
+  __device__ __forceinline__ uint8_t const* get(int target_rank) const {
+    // Valid EP4 routing metadata is in [0, 4); duplicate slots are filtered by dst_idx first.
+    return target_rank == 0   ? rank0_
+           : target_rank == 1 ? rank1_
+           : target_rank == 2 ? rank2_
+                              : rank3_;
+  }
+
+ private:
+  uint8_t const* rank0_;
+  uint8_t const* rank1_;
+  uint8_t const* rank2_;
+  uint8_t const* rank3_;
+};
+
 template <typename T, int ELEMS_PER_VEC>
 __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
 #pragma unroll
@@ -556,16 +609,16 @@ __device__ __forceinline__ void accumulate_vec(T* dst, T const* src) {
 }
 
 // Accumulate across all valid ranks into registers, then store once per segment
-template <int VEC_SIZE_BYTES, int TOP_K, typename T,
+template <int VEC_SIZE_BYTES, int TOP_K, typename T, int EP_SIZE, typename PointerType,
           MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
                                         int row_size, int rank_id, int max_tokens_per_rank,
-                                        CombineKernelPointers const& ptrs,
-                                        float OutputScalarScale = 1.0f) {
+                                        PointerType const& ptrs, float OutputScalarScale = 1.0f) {
   constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
   const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
+  CombineRecvBufferAccessor<EP_SIZE, PointerType> recv_buffers(ptrs);
 
   uint8_t* dst_bytes;
   if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
@@ -596,7 +649,7 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
         continue;
       }
 
-      uint8_t const* recv_buffer = static_cast<uint8_t const*>(ptrs.recv_buffers[target_rank][0]);
+      uint8_t const* recv_buffer = recv_buffers.get(target_rank);
       size_t base_source_rank =
           static_cast<size_t>(rank_id) * static_cast<size_t>(max_tokens_per_rank) +
           static_cast<size_t>(dst_idx);
@@ -810,32 +863,32 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
 }
 
 // Wrapper that selects vector width based on size_per_token alignment
-template <int TOP_K, typename T, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+template <int TOP_K, typename T, int EP_SIZE, typename PointerType,
+          MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
-                                   int rank_id, int max_tokens_per_rank,
-                                   CombineKernelPointers const& ptrs,
+                                   int rank_id, int max_tokens_per_rank, PointerType const& ptrs,
                                    float OutputScalarScale = 1.0f) {
   if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
-    vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
+    vectorized_combine_impl<16, TOP_K, T, EP_SIZE, PointerType, QuantMode, SwizzleMode>(
         output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs,
         OutputScalarScale);
   } else {
     if (row_size % 16 == 0) {
-      vectorized_combine_impl<16, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                            max_tokens_per_rank, ptrs);
+      vectorized_combine_impl<16, TOP_K, T, EP_SIZE, PointerType>(
+          output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 8 == 0) {
-      vectorized_combine_impl<8, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+      vectorized_combine_impl<8, TOP_K, T, EP_SIZE, PointerType>(
+          output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 4 == 0) {
-      vectorized_combine_impl<4, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+      vectorized_combine_impl<4, TOP_K, T, EP_SIZE, PointerType>(
+          output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else if (row_size % 2 == 0) {
-      vectorized_combine_impl<2, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+      vectorized_combine_impl<2, TOP_K, T, EP_SIZE, PointerType>(
+          output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     } else {
-      vectorized_combine_impl<1, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+      vectorized_combine_impl<1, TOP_K, T, EP_SIZE, PointerType>(
+          output_buffer, nullptr, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs);
     }
   }
 }
@@ -877,10 +930,11 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
+template <typename T, int TOP_K, int EP_SIZE, typename PointerType,
+          MoeA2ACombineQuantMode QuantMode = MoeA2ACombineQuantMode::NONE,
           MoeA2ACombineSwizzleSFMode SwizzleMode = MoeA2ACombineSwizzleSFMode::LINEAR>
 __global__ void moeA2ACombineKernel(
-    const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
+    const PointerType ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
     float OutputScalarScale) {
   int local_token_idx = blockIdx.x;
@@ -895,6 +949,13 @@ __global__ void moeA2ACombineKernel(
     if (local_token_idx >= local_num_tokens) return;
   }
 
+  int active_ep_size;
+  if constexpr (EP_SIZE == kDynamicEpSize) {
+    active_ep_size = ep_size;
+  } else {
+    active_ep_size = EP_SIZE;
+  }
+
 #if !DISABLE_SYNC_FOR_PROFILING
   // In-kernel readiness synchronization at start of combine:
   // - One warp signals readiness to all peers with current flag_val.
@@ -907,7 +968,7 @@ __global__ void moeA2ACombineKernel(
     if (blockIdx.x == 0) {
       // asm volatile("fence.release.sys;");
 #pragma unroll 1  // No unroll
-      for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
+      for (int peer_rank = lane_id; peer_rank < active_ep_size; peer_rank += warpSize) {
         uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
         asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 #if ENABLE_DEBUG_PRINT
@@ -918,7 +979,7 @@ __global__ void moeA2ACombineKernel(
     }
 
 #pragma unroll 1  // No unroll
-    for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize) {
+    for (int peer_rank = lane_id; peer_rank < active_ep_size; peer_rank += warpSize) {
       bool flag_set = false;
       [[maybe_unused]] auto s = clock64();
       do {
@@ -955,7 +1016,7 @@ __global__ void moeA2ACombineKernel(
   if (local_num_tokens == 0) return;
 
   // Accumulate across ranks in registers, then store once per segment
-  vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
+  vectorized_combine<TOP_K, T, EP_SIZE, PointerType, QuantMode, SwizzleMode>(
       ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
       max_tokens_per_rank, ptrs, OutputScalarScale);
 }
@@ -1010,6 +1071,31 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
     grid_size_block = 1;
   }
 
+  // Nemotron Ultra's combine path is BF16 even though its expert weights are NVFP4. Keep this
+  // specialization narrow so other dtypes, quantized outputs, swizzles, EP sizes, and top-k values
+  // retain the generic implementation and its existing launch matrix.
+  if (params.ep_size == kEp4Size && params.top_k == 22 &&
+      params.dtype == nvinfer1::DataType::kBF16 &&
+      params.quant_mode == MoeA2ACombineQuantMode::NONE &&
+      params.swizzle_mode == MoeA2ACombineSwizzleSFMode::LINEAR) {
+    Ep4CombineKernelPointers kernel_ptrs = {};
+    kernel_ptrs.src_data_ptrs[0] = params.output_data;
+    kernel_ptrs.output_scales = params.output_scales;
+    for (int rank = 0; rank < kEp4Size; ++rank) {
+      kernel_ptrs.recv_buffers[rank][0] = params.recv_buffers[rank];
+      kernel_ptrs.completion_flags[rank] = params.completion_flags[rank];
+    }
+    kernel_ptrs.flag_val = params.flag_val;
+    kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
+    kernel_ptrs.topk_send_indices = params.topk_send_indices;
+
+    moeA2ACombineKernel<__nv_bfloat16, 22, kEp4Size, Ep4CombineKernelPointers>
+        <<<grid_size_block, kBlockSize, 0, params.stream>>>(
+            kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+            params.local_num_tokens, params.ep_rank, params.ep_size, params.output_scalar_scale);
+    return;
+  }
+
   // Prepare kernel pointers struct for combine
   CombineKernelPointers kernel_ptrs = {};  // Zero-initialize
 
@@ -1037,11 +1123,10 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
     SWITCH_TOP_K(params.top_k, TOP_K, {
       SWITCH_QUANT_MODE(TKernelType, params.quant_mode, QUANT_MODE, {
         SWITCH_SWIZZLE_MODE(params.swizzle_mode, SWIZZLE_MODE, {
-          moeA2ACombineKernel<TKernelType, TOP_K, QUANT_MODE, SWIZZLE_MODE>
-              <<<grid_size_block, kBlockSize, 0, params.stream>>>(
-                  kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
-                  params.local_num_tokens, params.ep_rank, params.ep_size,
-                  params.output_scalar_scale);
+          moeA2ACombineKernel<TKernelType, TOP_K, kDynamicEpSize, CombineKernelPointers, QUANT_MODE,
+                              SWIZZLE_MODE><<<grid_size_block, kBlockSize, 0, params.stream>>>(
+              kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
+              params.local_num_tokens, params.ep_rank, params.ep_size, params.output_scalar_scale);
         });
       });
     });
