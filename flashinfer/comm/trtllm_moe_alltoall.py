@@ -94,6 +94,37 @@ def get_moe_alltoall_module():
         )
 
     @register_custom_op(
+        "flashinfer::moe_a2a_dispatch_nvfp4",
+        mutates_args=("workspace",),
+    )
+    def moe_a2a_dispatch_nvfp4(
+        hidden_states: torch.Tensor,
+        hidden_states_global_scale: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        passthrough_payloads: list[torch.Tensor],
+        workspace: torch.Tensor,
+        metainfo: torch.Tensor,
+        runtime_max_tokens_per_rank: int,
+        ep_rank: int,
+        ep_size: int,
+        top_k: int,
+        num_experts: int,
+    ):
+        return module.moe_a2a_dispatch_nvfp4(
+            hidden_states,
+            hidden_states_global_scale,
+            token_selected_experts,
+            passthrough_payloads,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            num_experts,
+        )
+
+    @register_custom_op(
         "flashinfer::moe_a2a_combine",
         mutates_args=("workspace",),
     )
@@ -248,6 +279,7 @@ def get_moe_alltoall_module():
     return SimpleNamespace(
         moe_a2a_initialize=moe_a2a_initialize,
         moe_a2a_dispatch=moe_a2a_dispatch,
+        moe_a2a_dispatch_nvfp4=moe_a2a_dispatch_nvfp4,
         moe_a2a_combine=moe_a2a_combine,
         moe_a2a_combine_into=moe_a2a_combine_into,
         moe_a2a_sanitize_expert_ids=moe_a2a_sanitize_expert_ids,
@@ -407,7 +439,7 @@ def moe_a2a_dispatch(
     )
 
     output_payloads = []
-    for input_payload, offset, size in zip(
+    for input_payload, offset, size in zip(  # type: ignore[call-overload]
         input_payloads, recv_offsets, recv_sizes, strict=True
     ):
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
@@ -418,6 +450,92 @@ def moe_a2a_dispatch(
                 offset,
                 offset + size,
                 input_payload.dtype,
+            )
+        )
+
+    return output_payloads, combine_payload_offset
+
+
+@flashinfer_api
+def moe_a2a_dispatch_nvfp4(
+    hidden_states: torch.Tensor,
+    hidden_states_global_scale: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    passthrough_payloads: list[torch.Tensor],
+    workspace: torch.Tensor,
+    metainfo: torch.Tensor,
+    runtime_max_tokens_per_rank: int,
+    ep_rank: int,
+    ep_size: int,
+    top_k: int,
+    num_experts: int,
+):
+    r"""Quantize BF16 activations to NVFP4 while dispatching them.
+
+    This is an opt-in Blackwell path. It writes packed FP4 activations and
+    linear E4M3 block scales directly to the destination workspaces, avoiding
+    materialized local quantization outputs. Generic payload dispatch is not
+    changed.
+
+    Parameters
+    ----------
+    hidden_states : torch.Tensor
+        Contiguous BF16 tensor shaped ``[local_num_tokens, hidden_size]``.
+        ``hidden_size`` must be divisible by 16.
+    hidden_states_global_scale : torch.Tensor
+        Device FP32 scalar using the standard NVFP4 encode-scale convention,
+        normally ``(448 * 6) / hidden_states.abs().max()``.
+    token_selected_experts : torch.Tensor
+        ``[local_num_tokens, top_k]`` int32 routing tensor.
+    passthrough_payloads : list[torch.Tensor]
+        Up to four ordinary 2D payloads to dispatch after the generated
+        activation and scale tensors. Typical entries are expert IDs and
+        router weights.
+    workspace, metainfo, runtime_max_tokens_per_rank, ep_rank, ep_size, top_k, num_experts
+        Same contracts as :func:`moe_a2a_dispatch`.
+
+    Returns
+    -------
+    Tuple[list[torch.Tensor], int]
+        The output list is ``[packed_activation, block_scales,
+        *passthrough_payloads]``. Packed activation shape is
+        ``[ep_size, runtime_max_tokens_per_rank, hidden_size / 2]`` and scale
+        shape is ``[..., hidden_size / 16]``; both use ``torch.uint8``.
+
+    Notes
+    -----
+    The path requires SM100+, linear scales, scalar global scaling, and the
+    standard NVFP4 recipe. ``FLASHINFER_NVFP4_4OVER6=1`` is rejected.
+    """
+    recv_offsets, recv_sizes, combine_payload_offset = (
+        get_moe_alltoall_module().moe_a2a_dispatch_nvfp4(
+            hidden_states,
+            hidden_states_global_scale,
+            token_selected_experts,
+            passthrough_payloads,
+            workspace,
+            metainfo,
+            runtime_max_tokens_per_rank,
+            ep_rank,
+            ep_size,
+            top_k,
+            num_experts,
+        )
+    )
+
+    output_dtypes = [torch.uint8, torch.uint8]
+    output_dtypes.extend(payload.dtype for payload in passthrough_payloads)
+    output_payloads = []
+    for dtype, offset, size in zip(  # type: ignore[call-overload]
+        output_dtypes, recv_offsets, recv_sizes, strict=True
+    ):
+        output_payloads.append(
+            moe_a2a_wrap_payload_tensor_in_workspace(
+                workspace,
+                [ep_size, runtime_max_tokens_per_rank],
+                offset,
+                offset + size,
+                dtype,
             )
         )
 
@@ -707,6 +825,38 @@ class MoeAlltoAll:
             combine_payload_size_per_token,
         )
 
+    @staticmethod
+    @flashinfer_api
+    def get_nvfp4_moe_workspace_size_per_rank(
+        ep_size: int,
+        top_k: int,
+        max_num_tokens: int,
+        hidden_size: int,
+        extra_payload_bytes_per_token: int = 0,
+    ) -> int:
+        r"""Size a workspace for standard fused NVFP4 dispatch payloads.
+
+        The standard payload set is packed activation, one E4M3 scale per
+        16 hidden elements, int32 expert IDs, and float32 router weights.
+        Combine remains BF16.
+        """
+        if hidden_size <= 0 or hidden_size % 16 != 0:
+            raise ValueError("hidden_size must be positive and divisible by 16")
+        total_dispatch_payload_size_per_token = (
+            hidden_size // 2
+            + hidden_size // 16
+            + top_k * 4
+            + top_k * 4
+            + extra_payload_bytes_per_token
+        )
+        combine_payload_size_per_token = hidden_size * 2
+        return moe_a2a_get_workspace_size_per_rank(
+            ep_size,
+            max_num_tokens,
+            total_dispatch_payload_size_per_token,
+            combine_payload_size_per_token,
+        )
+
     # Metainfo index constants (loaded dynamically from C++)
     # These offsets allow accessing internal workspace data for testing/debugging
     _METAINFO_INDEX: Optional[dict] = None
@@ -973,6 +1123,61 @@ class MoeAlltoAll:
         return recv_tensors
 
     @flashinfer_api
+    def dispatch_nvfp4(
+        self,
+        hidden_states: torch.Tensor,
+        hidden_states_global_scale: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        passthrough_payloads: list[torch.Tensor],
+        runtime_max_tokens_per_rank: int,
+        invalid_token_expert_id: Optional[int] = None,
+        expert_id_passthrough_index: Optional[int] = None,
+    ) -> list[torch.Tensor]:
+        r"""Run fused BF16-to-NVFP4 quantization and dispatch.
+
+        ``expert_id_passthrough_index`` is relative to
+        ``passthrough_payloads``; generated activation and scale outputs are
+        prepended to the returned list.
+        """
+        assert self._state.phase == "idle", "dispatch called twice without combine"
+        assert runtime_max_tokens_per_rank <= self.max_num_tokens, (
+            "runtime_max_tokens_per_rank exceeds max_num_tokens"
+        )
+
+        recv_tensors, combine_payload_offset = moe_a2a_dispatch_nvfp4(
+            hidden_states,
+            hidden_states_global_scale,
+            token_selected_experts,
+            passthrough_payloads,
+            self.workspace,
+            self.metainfo,
+            runtime_max_tokens_per_rank,
+            self.ep_rank,
+            self.ep_size,
+            self.top_k,
+            self.num_experts,
+        )
+
+        self._state.local_num_tokens = token_selected_experts.size(0)
+        self._state.combine_payload_offset = combine_payload_offset
+        self._state.phase = "dispatched"
+
+        if invalid_token_expert_id is not None:
+            assert expert_id_passthrough_index is not None, (
+                "expert_id_passthrough_index required when invalid_token_expert_id is set"
+            )
+            recv_expert_ids = recv_tensors[expert_id_passthrough_index + 2]
+            moe_a2a_sanitize_expert_ids(
+                recv_expert_ids,
+                self.workspace,
+                self.metainfo,
+                self.ep_rank,
+                invalid_token_expert_id,
+            )
+
+        return recv_tensors
+
+    @flashinfer_api
     def combine(
         self,
         payload: torch.Tensor,
@@ -1107,6 +1312,7 @@ __all__ = [
     "MoeAlltoAll",
     "moe_a2a_combine",
     "moe_a2a_dispatch",
+    "moe_a2a_dispatch_nvfp4",
     "moe_a2a_get_workspace_size_per_rank",
     "moe_a2a_initialize",
     "moe_a2a_sanitize_expert_ids",
