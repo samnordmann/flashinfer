@@ -767,7 +767,8 @@ template <int VEC_SIZE_BYTES, int TOP_K, typename T,
 __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, int row_idx,
                                         int row_size, int rank_id, int max_tokens_per_rank,
                                         CombineKernelPointers const& ptrs,
-                                        float OutputScalarScale = 1.0f) {
+                                        float OutputScalarScale = 1.0f,
+                                        float OutputMultiplier = 1.0f) {
   constexpr int elems_per_vec = VEC_SIZE_BYTES / sizeof(T);
   const int size_per_token = row_size * sizeof(T);
   using flashinfer::vec_t;
@@ -967,6 +968,14 @@ __device__ void vectorized_combine_impl(void* output_buffer, void* sf_output, in
         accumulate_vec<T, elems_per_vec>(a0, ak);
       }
     }
+    if (OutputMultiplier != 1.0f) {
+      T* values = reinterpret_cast<T*>(&acc[0]);
+#pragma unroll
+      for (int i = 0; i < elems_per_vec; ++i) {
+        values[i] = static_cast<T>(static_cast<float>(values[i]) * OutputMultiplier);
+      }
+    }
+
     if constexpr (QuantMode == MoeA2ACombineQuantMode::NONE) {
       acc[0].store(dst_bytes + offset);
     } else {
@@ -1020,27 +1029,32 @@ template <int TOP_K, typename T, MoeA2ACombineQuantMode QuantMode = MoeA2ACombin
 __device__ void vectorized_combine(void* output_buffer, void* sf_output, int row_idx, int row_size,
                                    int rank_id, int max_tokens_per_rank,
                                    CombineKernelPointers const& ptrs,
-                                   float OutputScalarScale = 1.0f) {
+                                   float OutputScalarScale = 1.0f, float OutputMultiplier = 1.0f) {
   if constexpr (QuantMode != MoeA2ACombineQuantMode::NONE) {
     vectorized_combine_impl<16, TOP_K, T, QuantMode, SwizzleMode>(
         output_buffer, sf_output, row_idx, row_size, rank_id, max_tokens_per_rank, ptrs,
-        OutputScalarScale);
+        OutputScalarScale, OutputMultiplier);
   } else {
     if (row_size % 16 == 0) {
       vectorized_combine_impl<16, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                            max_tokens_per_rank, ptrs);
+                                            max_tokens_per_rank, ptrs, OutputScalarScale,
+                                            OutputMultiplier);
     } else if (row_size % 8 == 0) {
       vectorized_combine_impl<8, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+                                           max_tokens_per_rank, ptrs, OutputScalarScale,
+                                           OutputMultiplier);
     } else if (row_size % 4 == 0) {
       vectorized_combine_impl<4, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+                                           max_tokens_per_rank, ptrs, OutputScalarScale,
+                                           OutputMultiplier);
     } else if (row_size % 2 == 0) {
       vectorized_combine_impl<2, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+                                           max_tokens_per_rank, ptrs, OutputScalarScale,
+                                           OutputMultiplier);
     } else {
       vectorized_combine_impl<1, TOP_K, T>(output_buffer, nullptr, row_idx, row_size, rank_id,
-                                           max_tokens_per_rank, ptrs);
+                                           max_tokens_per_rank, ptrs, OutputScalarScale,
+                                           OutputMultiplier);
     }
   }
 }
@@ -1087,7 +1101,7 @@ template <typename T, int TOP_K, MoeA2ACombineQuantMode QuantMode = MoeA2ACombin
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs,  // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
-    float OutputScalarScale) {
+    float OutputScalarScale, float OutputMultiplier) {
   int local_token_idx = blockIdx.x;
 
   if (local_num_tokens == 0) {
@@ -1162,7 +1176,7 @@ __global__ void moeA2ACombineKernel(
   // Accumulate across ranks in registers, then store once per segment
   vectorized_combine<TOP_K, T, QuantMode, SwizzleMode>(
       ptrs.src_data_ptrs[0], ptrs.output_scales, local_token_idx, elements_per_token, rank_id,
-      max_tokens_per_rank, ptrs, OutputScalarScale);
+      max_tokens_per_rank, ptrs, OutputScalarScale, OutputMultiplier);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
@@ -1246,7 +1260,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
               <<<grid_size_block, kBlockSize, 0, params.stream>>>(
                   kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token,
                   params.local_num_tokens, params.ep_rank, params.ep_size,
-                  params.output_scalar_scale);
+                  params.output_scalar_scale, params.output_multiplier);
         });
       });
     });
