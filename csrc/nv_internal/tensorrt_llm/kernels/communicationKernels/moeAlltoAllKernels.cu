@@ -1079,9 +1079,6 @@ void moe_a2a_dispatch_nvfp4_launch(MoeA2ADispatchParams const& params, float con
              hidden_size / 2);
   TLLM_CHECK(params.payloads[1].element_size * params.payloads[1].elements_per_token ==
              hidden_size / 16);
-  TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvNVFP4Use4Over6(),
-                       "Fused NVFP4 dispatch does not support FLASHINFER_NVFP4_4OVER6");
-
   DispatchKernelPointers kernel_ptrs = {};
   for (int i = 0; i < params.num_payloads; ++i) {
     kernel_ptrs.src_data_ptrs[i] = params.payloads[i].src_data;

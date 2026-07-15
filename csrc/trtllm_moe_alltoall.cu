@@ -409,9 +409,6 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchNvfp4Op(
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
   TVM_FFI_ICHECK_GE(tensorrt_llm::common::getSMVersion(), 100)
       << "Fused NVFP4 dispatch requires SM>=100 (Blackwell)";
-  TVM_FFI_ICHECK(!tensorrt_llm::common::getEnvNVFP4Use4Over6())
-      << "Fused NVFP4 dispatch does not support FLASHINFER_NVFP4_4OVER6";
-
   std::vector<PayloadDescriptor> payloadDescriptors(numPayloads);
   std::vector<int64_t> payloadByteSizes(numPayloads);
   payloadDescriptors[0].src_data = hiddenStates.data_ptr();
