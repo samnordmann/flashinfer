@@ -753,30 +753,28 @@ __global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
     int* compact_send_indices = smem + TOP_K;
     int* compact_count = smem + 2 * TOP_K;
 
-    if (threadIdx.x == 0) {
-      uint64_t already_copied = 0;
-      int count = 0;
-#pragma unroll 1
-      for (int k = 0; k < TOP_K; ++k) {
-        int const expert_id = token_selected_experts[local_token_idx * TOP_K + k];
+    if (threadIdx.x < warpSize) {
+      int const lane_id = threadIdx.x;
+      if (lane_id == 0) *compact_count = 0;
+      __syncwarp();
+
+      unsigned const topk_mask = __ballot_sync(0xffffffff, lane_id < TOP_K);
+      if (lane_id < TOP_K) {
+        int const metadata_idx = local_token_idx * TOP_K + lane_id;
+        int const expert_id = token_selected_experts[metadata_idx];
         int const target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
-        int const metadata_idx = local_token_idx * TOP_K + k;
-
-        if (already_copied & (1ULL << target_rank)) {
-          ptrs.topk_target_ranks[metadata_idx] = -1;
-          ptrs.topk_send_indices[metadata_idx] = -1;
-          continue;
+        unsigned const matching_lanes = __match_any_sync(topk_mask, target_rank);
+        bool const is_first = lane_id == __ffs(matching_lanes) - 1;
+        int dst_token_idx = -1;
+        if (is_first) {
+          dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
+          int const compact_idx = atomicAdd(compact_count, 1);
+          compact_target_ranks[compact_idx] = target_rank;
+          compact_send_indices[compact_idx] = dst_token_idx;
         }
-
-        int const dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
-        ptrs.topk_target_ranks[metadata_idx] = target_rank;
+        ptrs.topk_target_ranks[metadata_idx] = is_first ? target_rank : -1;
         ptrs.topk_send_indices[metadata_idx] = dst_token_idx;
-        compact_target_ranks[count] = target_rank;
-        compact_send_indices[count] = dst_token_idx;
-        ++count;
-        already_copied |= 1ULL << target_rank;
       }
-      *compact_count = count;
     }
     __syncthreads();
 
