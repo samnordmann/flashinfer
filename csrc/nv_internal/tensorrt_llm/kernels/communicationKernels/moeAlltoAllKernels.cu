@@ -783,7 +783,10 @@ void moe_a2a_dispatch_nvfp4_launch(MoeA2ADispatchParams const& params, float con
   kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
   kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
-  int const block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+  int const configured_block_size = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
+  int const block_size = hidden_size == 2048 && configured_block_size > kCompactDispatchBlockSize
+                             ? kCompactDispatchBlockSize
+                             : configured_block_size;
   int const grid_size = params.local_num_tokens == 0 ? 1 : params.local_num_tokens;
   int const shared_bytes = (2 * params.top_k + 1) * static_cast<int>(sizeof(int));
   bool const disable_fast_math = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
