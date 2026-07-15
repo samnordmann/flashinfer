@@ -6,6 +6,7 @@ supporting multiple payloads per collective operation.
 """
 
 from dataclasses import dataclass
+import os
 from types import SimpleNamespace
 from typing import Optional
 
@@ -488,7 +489,7 @@ def moe_a2a_dispatch_nvfp4(
     token_selected_experts : torch.Tensor
         ``[local_num_tokens, top_k]`` int32 routing tensor.
     passthrough_payloads : list[torch.Tensor]
-        Up to four ordinary 2D payloads to dispatch after the generated
+        Up to two ordinary 2D payloads to dispatch after the generated
         activation and scale tensors. Typical entries are expert IDs and
         router weights.
     workspace, metainfo, runtime_max_tokens_per_rank, ep_rank, ep_size, top_k, num_experts
@@ -507,6 +508,11 @@ def moe_a2a_dispatch_nvfp4(
     The path requires SM100+, linear scales, scalar global scaling, and the
     standard NVFP4 recipe. ``FLASHINFER_NVFP4_4OVER6=1`` is rejected.
     """
+    if os.environ.get("FLASHINFER_NVFP4_4OVER6") == "1":
+        raise ValueError(
+            "Fused NVFP4 dispatch does not support FLASHINFER_NVFP4_4OVER6"
+        )
+
     recv_offsets, recv_sizes, combine_payload_offset = (
         get_moe_alltoall_module().moe_a2a_dispatch_nvfp4(
             hidden_states,

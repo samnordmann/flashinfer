@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 
 TOP_K = 22
 NUM_EXPERTS = 512
-HIDDEN_SIZE = 8192
+HIDDEN_SIZE = 2048
 
 
 def _require_sm100() -> None:
@@ -75,7 +75,6 @@ def _launch_all_ranks(
     global_scale: torch.Tensor,
     routes: torch.Tensor,
     weights: torch.Tensor,
-    token_ids: torch.Tensor,
     quantized: list[tuple[torch.Tensor, torch.Tensor]],
     workspace: torch.Tensor,
     metainfo: list[torch.Tensor],
@@ -93,7 +92,7 @@ def _launch_all_ranks(
                     hidden_states[token_slice],
                     global_scale,
                     routes[token_slice],
-                    [routes[token_slice], weights[token_slice], token_ids[token_slice]],
+                    [routes[token_slice], weights[token_slice]],
                     workspace,
                     metainfo[rank],
                     num_tokens,
@@ -111,7 +110,6 @@ def _launch_all_ranks(
                         scales,
                         routes[token_slice],
                         weights[token_slice],
-                        token_ids[token_slice],
                     ],
                     workspace,
                     metainfo[rank],
@@ -165,8 +163,8 @@ def test_fused_nvfp4_dispatch_matches_materialized_dispatch(monkeypatch):
         device="cuda",
     )
     routes = _make_routes(world_size, num_tokens)
-    token_ids = torch.arange(total_tokens, dtype=torch.int32, device="cuda")[:, None]
-    weights = token_ids.to(torch.float32).expand(-1, TOP_K).contiguous()
+    token_ids = torch.arange(total_tokens, dtype=torch.int32, device="cuda")
+    weights = token_ids[:, None].to(torch.float32).expand(-1, TOP_K).contiguous()
     quantized = [
         nvfp4_quantize(
             hidden_states[rank * num_tokens : (rank + 1) * num_tokens],
@@ -177,19 +175,14 @@ def test_fused_nvfp4_dispatch_matches_materialized_dispatch(monkeypatch):
         for rank in range(world_size)
     ]
 
-    baseline_workspace, baseline_metainfo = _allocate_workspace(
-        world_size, num_tokens, token_ids.element_size()
-    )
-    fused_workspace, fused_metainfo = _allocate_workspace(
-        world_size, num_tokens, token_ids.element_size()
-    )
+    baseline_workspace, baseline_metainfo = _allocate_workspace(world_size, num_tokens)
+    fused_workspace, fused_metainfo = _allocate_workspace(world_size, num_tokens)
     baseline_outputs = _launch_all_ranks(
         False,
         hidden_states,
         global_scale,
         routes,
         weights,
-        token_ids,
         quantized,
         baseline_workspace,
         baseline_metainfo,
@@ -202,7 +195,6 @@ def test_fused_nvfp4_dispatch_matches_materialized_dispatch(monkeypatch):
         global_scale,
         routes,
         weights,
-        token_ids,
         quantized,
         fused_workspace,
         fused_metainfo,
@@ -228,11 +220,11 @@ def test_fused_nvfp4_dispatch_matches_materialized_dispatch(monkeypatch):
         )
         torch.testing.assert_close(fused_counts, baseline_counts, atol=0, rtol=0)
         for source_rank, valid in enumerate(baseline_counts.tolist()):
-            baseline_ids = baseline_outputs[target_rank][4][source_rank, :valid, 0]
-            fused_ids = fused_outputs[target_rank][4][source_rank, :valid, 0]
+            baseline_ids = baseline_outputs[target_rank][3][source_rank, :valid, 0]
+            fused_ids = fused_outputs[target_rank][3][source_rank, :valid, 0]
             baseline_order = torch.argsort(baseline_ids)
             fused_order = torch.argsort(fused_ids)
-            for payload_idx in range(5):
+            for payload_idx in range(4):
                 torch.testing.assert_close(
                     fused_outputs[target_rank][payload_idx][source_rank, :valid][
                         fused_order
