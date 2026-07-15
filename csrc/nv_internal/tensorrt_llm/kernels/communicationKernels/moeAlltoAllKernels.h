@@ -164,6 +164,7 @@ struct MoeA2ACombineParams {
   void* output_scales;                      // Optional output scales for quantized outputs
   float output_scalar_scale{1.0f};  // Per-tensor global scale applied before FP4 block scaling
                                     // (SFScaleVal); ignored by MXFP8/MXFP4 paths
+  float output_multiplier{1.0f};    // Value multiplier applied after reduction
 
   // Payload information
   int elements_per_token;    // Number of elements per token
