@@ -451,6 +451,7 @@ def combine_from_single_rank(
     output_dtype=None,
     output_scales_list=None,
     output_scalar_scale=1.0,
+    output_multiplier=1.0,
     sf_layout=SfLayout.layout_linear,
 ):
     combine_results = []
@@ -479,6 +480,7 @@ def combine_from_single_rank(
                         else None
                     ),
                     output_scalar_scale=output_scalar_scale,
+                    output_multiplier=output_multiplier,
                     sf_layout=sf_layout,
                 )
             )
@@ -879,6 +881,7 @@ def test_moe_combine_multi_rank_single_gpu(
         )
 
     output_scalar_scale = 1.0
+    output_multiplier = 2.0
     if quant_mode != CombineQuantMode.NONE:
         output_scalar_scale = (
             2.5  # arbitrary non-one scalar to test scaling path in the kernel
@@ -895,6 +898,7 @@ def test_moe_combine_multi_rank_single_gpu(
             combine_payload_offsets,
             payload_in_workspace=payload_in_workspace,
         )
+        reference_result.mul_(output_multiplier)
         sf_size = _compute_sf_size(quant_mode, num_tokens, vector_dim, sf_layout)
         if quant_mode == CombineQuantMode.MXFP8:
             output_dtype = torch.float8_e4m3fn
@@ -930,6 +934,7 @@ def test_moe_combine_multi_rank_single_gpu(
         output_scales_list=output_scales_list,
         sf_layout=sf_layout,
         output_scalar_scale=output_scalar_scale,
+        output_multiplier=output_multiplier,
     )
 
     if quant_mode == CombineQuantMode.NONE:
@@ -939,6 +944,7 @@ def test_moe_combine_multi_rank_single_gpu(
             num_experts,
             lora_ids=lora_ids,
         )
+        reference_result.mul_(output_multiplier)
         for rank in range(world_size):
             torch.testing.assert_close(
                 combine_results[rank],

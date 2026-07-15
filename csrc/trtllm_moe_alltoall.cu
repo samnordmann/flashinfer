@@ -278,7 +278,7 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
                          int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
                          bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
                          Optional<TensorView> outputScales, double outputScalarScale,
-                         int64_t sfLayout, TensorView output) {
+                         double outputMultiplier, int64_t sfLayout, TensorView output) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -346,6 +346,7 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   params.dtype = toNvDataType(payload.dtype());
   params.swizzle_mode = static_cast<MoeA2ACombineSwizzleSFMode>(sfLayout);
   params.output_scalar_scale = static_cast<float>(outputScalarScale);
+  params.output_multiplier = static_cast<float>(outputMultiplier);
 
   // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
@@ -410,7 +411,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
                        int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
                        bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
                        Optional<TensorView> outputScales, double outputScalarScale,
-                       int64_t sfLayout) {
+                       double outputMultiplier, int64_t sfLayout) {
   CHECK_INPUT(payload);
   TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
       << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
@@ -422,7 +423,7 @@ Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView wo
       alloc_tensor(outputShape, outputDtype_.value_or(payload.dtype()), payload.device());
   moeA2ACombineIntoOp(payload, localNumTokens, workspace, metainfo, runtimeMaxTokensPerRank, epRank,
                       epSize, topK, combinePayloadOffset, payloadInWorkspace, outputDtype_,
-                      outputScales, outputScalarScale, sfLayout, output);
+                      outputScales, outputScalarScale, outputMultiplier, sfLayout, output);
   return output;
 }
 

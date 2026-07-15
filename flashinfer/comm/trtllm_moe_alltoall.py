@@ -111,6 +111,7 @@ def get_moe_alltoall_module():
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
         output_scalar_scale: float = 1.0,
+        output_multiplier: float = 1.0,
         sf_layout: Optional[SfLayout] = None,
     ) -> torch.Tensor:
         """
@@ -136,6 +137,7 @@ def get_moe_alltoall_module():
                 torch.float8_e4m3fn, vector size of 16
             output_scalar_scale: Per-tensor global scale applied before FP4 block scaling
                 (NVFP4 SFScaleVal). Defaults to 1.0; ignored by MXFP8/MXFP4 paths.
+            output_multiplier: Value multiplier applied after reduction. Defaults to 1.0.
             sf_layout: Output swizzle layout. Defaults to linear.
         Returns:
             output: [local_num_tokens, elements_per_token] tensor
@@ -154,6 +156,7 @@ def get_moe_alltoall_module():
             output_dtype,
             output_scales,
             output_scalar_scale,
+            output_multiplier,
             sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
         )
 
@@ -175,6 +178,7 @@ def get_moe_alltoall_module():
         output_dtype: Optional[torch.dtype],
         output_scales: Optional[torch.Tensor],
         output_scalar_scale: float,
+        output_multiplier: float,
         sf_layout: Optional[SfLayout],
         output: torch.Tensor,
     ) -> None:
@@ -192,6 +196,7 @@ def get_moe_alltoall_module():
             output_dtype,
             output_scales,
             output_scalar_scale,
+            output_multiplier,
             sf_layout.value if sf_layout is not None else SfLayout.layout_linear.value,
             output,
         )
@@ -439,6 +444,7 @@ def moe_a2a_combine(
     output_dtype: Optional[torch.dtype] = None,
     output_scales: Optional[torch.Tensor] = None,
     output_scalar_scale: float = 1.0,
+    output_multiplier: float = 1.0,
     sf_layout: SfLayout = SfLayout.layout_linear,
     output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -485,6 +491,9 @@ def moe_a2a_combine(
         Per-tensor global scale applied before FP4 block scaling
         (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
         paths.
+    output_multiplier : float
+        Value multiplier applied after top-k reduction and before output
+        conversion. Defaults to ``1.0``.
     sf_layout : SfLayout
         Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
     output : Optional[torch.Tensor]
@@ -520,6 +529,7 @@ def moe_a2a_combine(
         output_dtype,
         output_scales,
         output_scalar_scale,
+        output_multiplier,
         sf_layout,
     )
     if output is None:
@@ -981,6 +991,7 @@ class MoeAlltoAll:
         output_dtype: Optional[torch.dtype] = None,
         output_scales: Optional[torch.Tensor] = None,
         output_scalar_scale: float = 1.0,
+        output_multiplier: float = 1.0,
         sf_layout: SfLayout = SfLayout.layout_linear,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -1007,6 +1018,9 @@ class MoeAlltoAll:
             Per-tensor global scale applied before FP4 block scaling
             (NVFP4 SFScaleVal).  Defaults to ``1.0``; ignored by MXFP8/MXFP4
             paths.
+        output_multiplier : float
+            Value multiplier applied after top-k reduction and before output
+            conversion. Defaults to ``1.0``.
         sf_layout : SfLayout
             Output swizzle layout.  Defaults to ``SfLayout.layout_linear``.
         output : Optional[torch.Tensor]
@@ -1042,6 +1056,7 @@ class MoeAlltoAll:
             output_dtype,
             output_scales,
             output_scalar_scale,
+            output_multiplier,
             sf_layout,
             output,
         )
