@@ -8,7 +8,11 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.gemm import gen_bf16_gemm_nvfp4_module
-from ..utils import register_custom_op
+from ..utils import (
+    backend_requirement,
+    register_custom_op,
+    supported_compute_capability,
+)
 
 
 _HIDDEN_IN = 8192
@@ -35,6 +39,20 @@ def _check_inputs(
         raise TypeError("global_scale must be a one-element float32 tensor")
     if input.device != weight.device or input.device != global_scale.device:
         raise ValueError("input, weight, and global_scale must be on the same device")
+
+
+@supported_compute_capability([100])
+def _bf16_gemm_nvfp4_requirement(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    *,
+    output: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
+    launch_with_pdl: bool = False,
+) -> bool:
+    _check_inputs(input, weight, global_scale)
+    return True
 
 
 @functools.cache
@@ -65,6 +83,7 @@ def _get_module():
     return SimpleNamespace(op=op)
 
 
+@backend_requirement({}, common_check=_bf16_gemm_nvfp4_requirement)
 @flashinfer_api
 def bf16_gemm_nvfp4(
     input: torch.Tensor,
@@ -102,6 +121,8 @@ def bf16_gemm_nvfp4(
         raise ValueError(
             "output_scale must be contiguous float8_e4m3fn with shape (M, 128)"
         )
+    if output.device != input.device or output_scale.device != input.device:
+        raise ValueError("output and output_scale must be on the input device")
     if not output.is_contiguous() or not output_scale.is_contiguous():
         raise ValueError("output and output_scale must be contiguous")
     _get_module().op(
