@@ -33,6 +33,7 @@ from .gemm_svdquant import (
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
     svdquant_linear as svdquant_linear,
 )
+from .gemm_nvfp4 import bf16_gemm_nvfp4 as bf16_gemm_nvfp4
 
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
@@ -130,6 +131,7 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "bf16_gemm_nvfp4",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",

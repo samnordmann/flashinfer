@@ -82,6 +82,16 @@ def gen_mm_bf16_cublaslt_module() -> JitSpec:
     )
 
 
+def gen_bf16_gemm_nvfp4_module() -> JitSpec:
+    return gen_jit_spec(
+        "bf16_gemm_nvfp4",
+        [jit_env.FLASHINFER_CSRC_DIR / "bf16_gemm_nvfp4.cu"],
+        extra_cuda_cflags=sm100a_nvcc_flags
+        + ["-DENABLE_BF16", "-DENABLE_FP8", "-DENABLE_FP4"],
+        extra_cflags=["-DENABLE_BF16", "-DENABLE_FP8", "-DENABLE_FP4"],
+    )
+
+
 def gen_gemm_sm100_module_cutlass_fp4() -> JitSpec:
     gen_directory = jit_env.FLASHINFER_GEN_SRC_DIR / "gen_gemm_sm100_cutlass_fp4"
     os.makedirs(gen_directory, exist_ok=True)
