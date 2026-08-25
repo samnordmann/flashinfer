@@ -786,15 +786,19 @@ __global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
     auto const* hidden_states = static_cast<__nv_bfloat16 const*>(ptrs.src_data_ptrs[0]);
     float const sf_scale = __ldg(global_scale);
 
-    for (int sf_idx = threadIdx.x; sf_idx < scale_factors_per_token; sf_idx += blockDim.x) {
-      flashinfer::vec_t<__nv_bfloat16, 16> input_vec;
+    if (hidden_size == 2048 && blockDim.x == 256) {
+      // Two adjacent lanes share one block scale and each convert eight values. This uses the
+      // entire decode CTA; the 128-thread large-batch launch retains the 16-value path below.
+      int const packed_half_idx = threadIdx.x;
+      int const sf_idx = packed_half_idx / 2;
+      flashinfer::vec_t<__nv_bfloat16, 8> input_vec;
       input_vec.load(hidden_states + static_cast<size_t>(local_token_idx) * hidden_size +
-                     sf_idx * 16);
+                     packed_half_idx * 8);
       auto& packed_vec =
-          reinterpret_cast<tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 16>&>(input_vec);
+          reinterpret_cast<tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 8>&>(input_vec);
       uint8_t block_scale;
-      uint64_t const packed_fp4 =
-          tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 16, false,
+      uint32_t const packed_fp4 =
+          tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 8, false,
                                                       DISABLE_FP4_QUANT_FAST_MATH>(
               packed_vec, sf_scale, &block_scale);
 
@@ -805,12 +809,42 @@ __global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
         size_t const slot = static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_token_idx;
 
         auto* packed_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][0]) +
-                           slot * packed_bytes_per_token + sf_idx * sizeof(uint64_t);
-        *reinterpret_cast<uint64_t*>(packed_dst) = packed_fp4;
+                           slot * packed_bytes_per_token + packed_half_idx * sizeof(uint32_t);
+        *reinterpret_cast<uint32_t*>(packed_dst) = packed_fp4;
 
-        auto* scale_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][1]) +
-                          slot * scale_factors_per_token + sf_idx;
-        *scale_dst = block_scale;
+        if ((packed_half_idx & 1) == 0) {
+          auto* scale_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][1]) +
+                            slot * scale_factors_per_token + sf_idx;
+          *scale_dst = block_scale;
+        }
+      }
+    } else {
+      for (int sf_idx = threadIdx.x; sf_idx < scale_factors_per_token; sf_idx += blockDim.x) {
+        flashinfer::vec_t<__nv_bfloat16, 16> input_vec;
+        input_vec.load(hidden_states + static_cast<size_t>(local_token_idx) * hidden_size +
+                       sf_idx * 16);
+        auto& packed_vec =
+            reinterpret_cast<tensorrt_llm::kernels::PackedVec<__nv_bfloat16, 16>&>(input_vec);
+        uint8_t block_scale;
+        uint64_t const packed_fp4 =
+            tensorrt_llm::kernels::cvt_warp_fp16_to_fp4<__nv_bfloat16, 16, 16, false,
+                                                        DISABLE_FP4_QUANT_FAST_MATH>(
+                packed_vec, sf_scale, &block_scale);
+
+#pragma unroll 1
+        for (int destination_idx = 0; destination_idx < destination_count; ++destination_idx) {
+          int const target_rank = compact_target_ranks[destination_idx];
+          int const dst_token_idx = compact_send_indices[destination_idx];
+          size_t const slot = static_cast<size_t>(rank_id) * max_tokens_per_rank + dst_token_idx;
+
+          auto* packed_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][0]) +
+                             slot * packed_bytes_per_token + sf_idx * sizeof(uint64_t);
+          *reinterpret_cast<uint64_t*>(packed_dst) = packed_fp4;
+
+          auto* scale_dst = static_cast<uint8_t*>(ptrs.recv_buffers[target_rank][1]) +
+                            slot * scale_factors_per_token + sf_idx;
+          *scale_dst = block_scale;
+        }
       }
     }
 
