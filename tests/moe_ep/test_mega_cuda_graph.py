@@ -38,7 +38,12 @@ def _require_blackwell():
         pytest.skip(f"cutedsl mega kernels need sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
 
 
-def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int = 1024):
+def _single_rank_layer(
+    backend_name: str,
+    hidden: int = 2048,
+    intermediate: int = 1024,
+    activation: str = "swiglu",
+):
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging."""
     import torch
 
@@ -59,7 +64,7 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
     g = torch.Generator(device="cuda").manual_seed(21)
     w13 = torch.randn(
         num_experts,
-        2 * intermediate,
+        intermediate * (2 if activation == "swiglu" else 1),
         hidden,
         dtype=torch.bfloat16,
         device="cuda",
@@ -76,9 +81,14 @@ def _single_rank_layer(backend_name: str, hidden: int = 2048, intermediate: int 
 
     if backend_name == "nvfp4":
         mk = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
+            intermediate_size=intermediate,
+            top_k=topk,
+            activation=activation,
+            gate_up_clamp=10.0 if activation == "swiglu" else None,
         )
     else:
+        if activation != "swiglu":
+            raise ValueError("the MXFP8 graph fixture only supports SwiGLU")
         mk = Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=intermediate, top_k=topk, gate_up_clamp=10.0
         )
@@ -192,6 +202,34 @@ def test_mega_layer_graph_capture_replay_matches_eager(
         y_eager2 = layer.forward(t)
         torch.cuda.synchronize()
         assert torch.equal(y_replay, y_eager2)
+    finally:
+        layer.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_nvfp4_relu2_graph_capture_replay_matches_eager(monkeypatch):
+    """One-projection ReLU2 remains stable under graph capture and replay."""
+    import torch
+
+    _require_blackwell()
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    layer, problem = _single_rank_layer("nvfp4", activation="relu2")
+    try:
+        t = _random_batch(problem, seed=17)
+        layer.warmup()
+
+        y_eager = layer.forward(t).clone()
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y_graph = layer.forward(t)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.equal(y_graph, y_eager)
     finally:
         layer.destroy()
 
