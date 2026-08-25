@@ -35,6 +35,7 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define DISABLE_SYNC_FOR_PROFILING 0
 
 constexpr int kEp4Size = 4;
+constexpr int kEp8Size = 8;
 // Two 32-thread warps can cover at most 64 16-byte activation vectors.
 constexpr int kCompactDispatchMaxPayloadBytes = 1024;
 constexpr int kCompactDispatchBlockSize = 128;
@@ -426,7 +427,7 @@ __global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token
 // One CTA processes one token and all its payloads.
 // ============================================================================
 
-template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, bool COMPACT_EP4,
+template <int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK, int COMPACT_EP_SIZE,
           bool PHASE_H2048_NVFP4 = false, bool PHASE_NVFP4_PAYLOADS = false>
 __global__ void moeA2ADispatchKernel(
     int32_t const* token_selected_experts,  // [local_num_tokens, TOP_K]
@@ -435,7 +436,9 @@ __global__ void moeA2ADispatchKernel(
     int max_tokens_per_rank,                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts,
     bool enable_pdl) {
-  static_assert(!COMPACT_EP4 || TOP_K > kEp4Size);
+  constexpr bool COMPACT_DESTINATIONS = COMPACT_EP_SIZE > 0;
+  static_assert(COMPACT_EP_SIZE == 0 || COMPACT_EP_SIZE == kEp4Size || COMPACT_EP_SIZE == kEp8Size);
+  static_assert(!COMPACT_DESTINATIONS || TOP_K > COMPACT_EP_SIZE);
   static_assert(!PHASE_H2048_NVFP4 || TOP_K == 22);
   static_assert(!PHASE_NVFP4_PAYLOADS ||
                 (TOP_K > kEp4Size && TOP_K % 2 == 0 &&
@@ -466,7 +469,7 @@ __global__ void moeA2ADispatchKernel(
     int* smem_topk_target_ranks = smem;
     int* smem_topk_send_indices = nullptr;
     int* smem_compact_send_indices = smem;
-    if constexpr (!COMPACT_EP4) {
+    if constexpr (!COMPACT_DESTINATIONS) {
       smem_topk_send_indices = smem + TOP_K;
     }
 
@@ -478,8 +481,8 @@ __global__ void moeA2ADispatchKernel(
 
     if (thread_idx < warpSize) {
       int lane_id = thread_idx;
-      if constexpr (COMPACT_EP4) {
-        if (lane_id < kEp4Size) {
+      if constexpr (COMPACT_DESTINATIONS) {
+        if (lane_id < COMPACT_EP_SIZE) {
           smem_compact_send_indices[lane_id] = -1;
         }
         __syncwarp();
@@ -509,7 +512,7 @@ __global__ void moeA2ADispatchKernel(
         int dst_token_idx = -1;
         if (is_valid) {
           dst_token_idx = atomicAdd(&ptrs.send_counters[target_rank], 1);
-          if constexpr (COMPACT_EP4) {
+          if constexpr (COMPACT_DESTINATIONS) {
             smem_compact_send_indices[target_rank] = dst_token_idx;
           }
         } else {
@@ -518,7 +521,7 @@ __global__ void moeA2ADispatchKernel(
 
         ptrs.topk_target_ranks[local_token_idx * TOP_K + k] = target_rank;
         ptrs.topk_send_indices[local_token_idx * TOP_K + k] = dst_token_idx;
-        if constexpr (!COMPACT_EP4) {
+        if constexpr (!COMPACT_DESTINATIONS) {
           smem_topk_target_ranks[k] = target_rank;
           smem_topk_send_indices[k] = dst_token_idx;
         }
@@ -527,12 +530,11 @@ __global__ void moeA2ADispatchKernel(
     // Sync before dispatching data
     __syncthreads();
 
-    // EP4 has at most four unique destinations, regardless of TOP_K. The compact
-    // specialization avoids expanding those destinations back to TOP_K entries.
-    constexpr int NUM_DESTINATIONS = COMPACT_EP4 ? kEp4Size : TOP_K;
+    // A compact specialization keeps one slot per possible destination rank.
+    constexpr int NUM_DESTINATIONS = COMPACT_DESTINATIONS ? COMPACT_EP_SIZE : TOP_K;
     int target_ranks[NUM_DESTINATIONS];
     int send_indices[NUM_DESTINATIONS];
-    if constexpr (COMPACT_EP4) {
+    if constexpr (COMPACT_DESTINATIONS) {
 #pragma unroll
       for (int target_rank = 0; target_rank < NUM_DESTINATIONS; ++target_rank) {
         target_ranks[target_rank] = target_rank;
@@ -834,7 +836,16 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                          "Invalid H2048/top-k-22 NVFP4 dispatch payload layout");
         if (use_compact_ep4) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
-          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, true, true>;
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, kEp4Size, true>;
+          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
+                                   block_size, shared_bytes, params.stream,
+                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                                   params.max_tokens_per_rank, params.local_num_tokens,
+                                   params.ep_rank, params.ep_size, params.num_experts,
+                                   params.eplb_stats_num_experts, params.enable_pdl);
+        } else if (params.ep_size == kEp8Size) {
+          int shared_bytes = kEp8Size * (int)sizeof(int);
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, kEp8Size, true>;
           launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
                                    block_size, shared_bytes, params.stream,
                                    params.token_selected_experts, kernel_ptrs, params.num_payloads,
@@ -843,7 +854,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                                    params.eplb_stats_num_experts, params.enable_pdl);
         } else {
           int shared_bytes = 2 * params.top_k * (int)sizeof(int);
-          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, false, true>;
+          auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, 0, true>;
           launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
                                    block_size, shared_bytes, params.stream,
                                    params.token_selected_experts, kernel_ptrs, params.num_payloads,
@@ -856,8 +867,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
           SWITCH_TOP_K(
               params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
-                auto kernel_fn =
-                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true, false, true>;
+                auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kEp4Size,
+                                                      false, true>;
                 launchWithPdlWhenEnabled(
                     "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
@@ -870,7 +881,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
           SWITCH_TOP_K(
               params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size && TOP_K % 2 == 0) {
                 auto kernel_fn =
-                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false, false, true>;
+                    moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, 0, false, true>;
                 launchWithPdlWhenEnabled(
                     "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
@@ -883,7 +894,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
         int shared_bytes = kEp4Size * (int)sizeof(int);
         SWITCH_TOP_K(
             params.top_k, TOP_K, if constexpr (TOP_K > kEp4Size) {
-              auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, true>;
+              auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, kEp4Size>;
               launchWithPdlWhenEnabled(
                   "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
                   shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
@@ -894,7 +905,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
       } else {
         int shared_bytes = 2 * params.top_k * (int)sizeof(int);
         SWITCH_TOP_K(params.top_k, TOP_K, {
-          auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, false>;
+          auto kernel_fn = moeA2ADispatchKernel<TOP_K, EPLB_STATS, ENABLE_RANK_MASK, 0>;
           launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
                                    block_size, shared_bytes, params.stream,
                                    params.token_selected_experts, kernel_ptrs, params.num_payloads,
