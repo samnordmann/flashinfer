@@ -103,7 +103,7 @@ def _launch_all_ranks(
                 )
             else:
                 packed, scales = quantized[rank]
-                output, _ = moe_a2a_dispatch(
+                output, _, _ = moe_a2a_dispatch(
                     routes[token_slice],
                     [
                         packed,
