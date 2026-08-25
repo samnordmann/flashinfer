@@ -1052,10 +1052,6 @@ class SwapABSwigluFp4Epilogue:
             self._EpilogueFc1IntermediateGateUpTileSize
             // self.fc1_output_divisor
         )
-        self.fc1_output_blocks_per_warp = (
-            self.fc1_output_tile_size
-            // (self._EpilogueWarpCnt * Nvfp4BlockSize)
-        )
         # Done-counter publish batch granularity
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
@@ -1664,7 +1660,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 fc1_output_sf=fc1_output_sf,
                 subtile_idx=subtile_idx,
                 token_offsets=(0, 0),
-                output_blocks_in_warp=(0, 1),
+                output_offsets=(0, self.fc1_output_tile_size // 2),
             )
 
             token_32_64_tmem_trans = TmemTranspose32x32Inplace(
@@ -1688,7 +1684,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 fc1_output_sf=fc1_output_sf,
                 subtile_idx=subtile_idx,
                 token_offsets=(32, 32),
-                output_blocks_in_warp=(0, 1),
+                output_offsets=(0, self.fc1_output_tile_size // 2),
             )
 
         # Step 3: TMASTG
@@ -1916,12 +1912,12 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         fc1_output_sf: cute.Tensor,  # MoE domain (token_this_rank, intermediate_down, 1)
         subtile_idx: cutlass.Int32,
         token_offsets: Tuple[int, int] = (0, 32),
-        output_blocks_in_warp: Tuple[int, int] = (0, 0),
+        output_offsets: Tuple[int, int] = (0, 0),
     ):
         # Each input is one transposed 16-value NVFP4 block. The compile-time
-        # maps select its token row and channel block within the warp. SwiGLU
-        # uses the defaults (two token halves, one channel block); ReLU2 maps
-        # two adjacent channel blocks to the same token half.
+        # maps select its token row and channel offset. SwiGLU uses the defaults
+        # (two token halves, one channel block); ReLU2 maps the two accumulator
+        # fragments to the lower and upper 64-channel halves of the same token.
         #
         # Per token (ported from PostSwigluHalf._gen_sfc_quantize + stg_sfc + r2s):
         #   1. (Path A) pre-multiply topk weight into the values, if present.
@@ -1965,14 +1961,11 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         for half in cutlass.range_constexpr(2):
             tok = two_token[half]
-            output_block_in_warp = output_blocks_in_warp[half]
+            output_offset = output_offsets[half]
             intermediate_idx = (
                 work_tile_info.tile_m_idx * self.fc1_output_tile_size
-                + (
-                    self.warp_idx * self.fc1_output_blocks_per_warp
-                    + output_block_in_warp
-                )
-                * Nvfp4BlockSize
+                + output_offset
+                + self.warp_idx * Nvfp4BlockSize
             )
 
             # 1) topk-weight pre-multiply (Path A) into a weighted scratch.
@@ -2010,8 +2003,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 (0, None),
                 (
                     self.lane_idx + token_offsets[half],
-                    self.warp_idx * self.fc1_output_blocks_per_warp
-                    + output_block_in_warp,
+                    self.warp_idx + output_offset // Nvfp4BlockSize,
                 ),
             ]
             cute.copy(
