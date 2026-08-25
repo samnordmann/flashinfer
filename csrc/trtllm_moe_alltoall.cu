@@ -404,8 +404,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchNvfp4Op(
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank > 0);
   TVM_FFI_ICHECK(runtimeMaxTokensPerRank >= localNumTokens)
       << "runtime_max_tokens_per_rank must cover local hidden states";
-  TVM_FFI_ICHECK(numExperts >= epSize && numExperts % epSize == 0)
-      << "num_experts must be divisible by ep_size";
+  TVM_FFI_ICHECK(numExperts >= epSize) << "num_experts must cover all EP ranks";
   TVM_FFI_ICHECK(topK > 0 && topK <= tl_throughput::kMaxTopK);
   TVM_FFI_ICHECK_GE(tensorrt_llm::common::getSMVersion(), 100)
       << "Fused NVFP4 dispatch requires SM>=100 (Blackwell)";
@@ -448,7 +447,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t> moeA2ADispatchNvfp4Op(
   tl_throughput::MoeA2ADispatchParams params{};
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
-  params.num_experts_per_rank = static_cast<int>(numExperts / epSize);
+  params.num_experts = static_cast<int>(numExperts);
   params.local_num_tokens = localNumTokens;
   params.max_tokens_per_rank = static_cast<int>(runtimeMaxTokensPerRank);
   params.top_k = static_cast<int>(topK);

@@ -737,9 +737,11 @@ template <int TOP_K, bool DISABLE_FP4_QUANT_FAST_MATH>
 __global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
                                           DispatchKernelPointers const ptrs, int num_payloads,
                                           int max_tokens_per_rank, int local_num_tokens,
-                                          int rank_id, int ep_size, int num_experts_per_rank,
+                                          int rank_id, int ep_size, int num_experts,
                                           float const* global_scale, int hidden_size) {
   int const local_token_idx = blockIdx.x;
+  int const ep_base = num_experts / ep_size;
+  int const ep_remainder = num_experts % ep_size;
 
   if (local_num_tokens == 0) {
     if (local_token_idx > 0) return;
@@ -762,7 +764,7 @@ __global__ void moeA2ANvfp4DispatchKernel(int32_t const* token_selected_experts,
       if (lane_id < TOP_K) {
         int const metadata_idx = local_token_idx * TOP_K + lane_id;
         int const expert_id = token_selected_experts[metadata_idx];
-        int const target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+        int const target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
         unsigned const matching_lanes = __match_any_sync(topk_mask, target_rank);
         bool const is_first = lane_id == __ffs(matching_lanes) - 1;
         int dst_token_idx = -1;
@@ -1103,14 +1105,13 @@ void moe_a2a_dispatch_nvfp4_launch(MoeA2ADispatchParams const& params, float con
   int const grid_size = params.local_num_tokens == 0 ? 1 : params.local_num_tokens;
   int const shared_bytes = (2 * params.top_k + 1) * static_cast<int>(sizeof(int));
   bool const disable_fast_math = tensorrt_llm::common::getEnvDisableFP4QuantFastMath();
-  SWITCH_BOOL(
-      disable_fast_math, DISABLE_FP4_QUANT_FAST_MATH,
-      SWITCH_TOP_K(params.top_k, TOP_K,
-                   moeA2ANvfp4DispatchKernel<TOP_K, DISABLE_FP4_QUANT_FAST_MATH>
-                   <<<grid_size, block_size, shared_bytes, params.stream>>>(
-                       params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                       params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
-                       params.ep_size, params.num_experts_per_rank, global_scale, hidden_size)))
+  SWITCH_BOOL(disable_fast_math, DISABLE_FP4_QUANT_FAST_MATH,
+              SWITCH_TOP_K(params.top_k, TOP_K,
+                           moeA2ANvfp4DispatchKernel<TOP_K, DISABLE_FP4_QUANT_FAST_MATH>
+                           <<<grid_size, block_size, shared_bytes, params.stream>>>(
+                               params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                               params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank,
+                               params.ep_size, params.num_experts, global_scale, hidden_size)))
 }
 
 // ============================================================================
