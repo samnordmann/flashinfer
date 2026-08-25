@@ -70,7 +70,7 @@ def test_bf16_gemm_nvfp4_advertises_only_validated_architecture():
     assert not bf16_gemm_nvfp4.is_compute_capability_supported(103)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_bf16_gemm_nvfp4_matches_unfused(num_tokens):
     from flashinfer.gemm import bf16_gemm_nvfp4
 
@@ -85,7 +85,7 @@ def test_bf16_gemm_nvfp4_matches_unfused(num_tokens):
     _assert_matches_reference(actual, expected, projected, global_scale)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 17, 64])
+@pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_bf16_gemm_nvfp4_changing_input_cuda_graph(num_tokens):
     from flashinfer.gemm import bf16_gemm_nvfp4
 
@@ -137,6 +137,17 @@ def test_bf16_gemm_nvfp4_changing_input_cuda_graph(num_tokens):
         projected,
         global_scale,
     )
+
+
+def test_bf16_gemm_nvfp4_rejects_unprofitable_row_count():
+    from flashinfer.gemm import bf16_gemm_nvfp4
+
+    input = torch.empty(17, 8192, device="cuda", dtype=torch.bfloat16)
+    weight = torch.empty(2048, 8192, device="cuda", dtype=torch.bfloat16)
+    global_scale = torch.ones(1, device="cuda", dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=r"input rows must be in \[1, 16\]"):
+        bf16_gemm_nvfp4(input, weight, global_scale)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two GPUs are required")

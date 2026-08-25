@@ -17,7 +17,7 @@ from ..utils import (
 
 _HIDDEN_IN = 8192
 _HIDDEN_OUT = 2048
-_MAX_TOKENS = 256
+_MAX_TOKENS = 16
 
 
 def _check_inputs(
@@ -96,7 +96,7 @@ def bf16_gemm_nvfp4(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute ``input @ weight.T`` and emit linear NVFP4 data and scales.
 
-    The specialized shape is ``K=8192, N=2048, 1 <= M <= 256``. Accumulators
+    The specialized shape is ``K=8192, N=2048, 1 <= M <= 16``. Accumulators
     are rounded to BF16 before block-16 NVFP4 quantization to match the
     unfused projection-output contract.
     """
