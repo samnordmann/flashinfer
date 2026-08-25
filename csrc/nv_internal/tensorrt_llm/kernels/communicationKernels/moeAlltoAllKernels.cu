@@ -375,6 +375,21 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
   }
 }
 
+template <int VEC_SIZE>
+__device__ void vectorized_dispatch_store_global(flashinfer::vec_t<uint8_t, VEC_SIZE> const& value,
+                                                 uint8_t* dst) {
+  static_assert(VEC_SIZE == 8 || VEC_SIZE == 16);
+  if constexpr (VEC_SIZE == 16) {
+    int4 const& data = value.data[0];
+    asm volatile("st.global.v4.u32 [%4], {%0, %1, %2, %3};"
+                 :
+                 : "r"(data.x), "r"(data.y), "r"(data.z), "r"(data.w), "l"(dst));
+  } else {
+    uint2 const& data = value.data;
+    asm volatile("st.global.v2.u32 [%2], {%0, %1};" : : "r"(data.x), "r"(data.y), "l"(dst));
+  }
+}
+
 template <int VEC_SIZE, int TOP_K>
 __device__ void vectorized_dispatch_cached_impl(uint8_t const* src_ptr, int bytes_per_token,
                                                 uint8_t* const* dst_base_k, int worker_idx,
@@ -390,7 +405,7 @@ __device__ void vectorized_dispatch_cached_impl(uint8_t const* src_ptr, int byte
     for (int k = 0; k < TOP_K; ++k) {
       uint8_t* dst_base = dst_base_k[k];
       if (dst_base != nullptr) {
-        v.store(dst_base + offset);
+        vectorized_dispatch_store_global<VEC_SIZE>(v, dst_base + offset);
       }
     }
   }
