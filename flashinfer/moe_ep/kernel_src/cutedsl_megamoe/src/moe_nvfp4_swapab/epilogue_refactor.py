@@ -1772,15 +1772,23 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             raise ValueError("alpha_relu2: value_rmem must be a register tensor")
         if cutlass.const_expr(cute.rank(value_rmem) != 1):
             raise ValueError("alpha_relu2: value_rmem must be one-dimensional")
+        if cutlass.const_expr(cute.size(value_rmem) % 2 != 0):
+            raise ValueError("alpha_relu2: value_rmem size must be even")
+
         n = cute.size(value_rmem)
         out = cute.make_rmem_tensor((n,), cutlass.Float32)
         zero = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(n):
-            value = value_rmem[i]
+        for i in cutlass.range_constexpr(0, n, 2):
+            values = (value_rmem[i], value_rmem[i + 1])
             if cutlass.const_expr(alpha_val is not None):
-                value = value * alpha_val
-            relu = cute.arch.fmax(value, zero)
-            out[i] = relu * relu
+                values = cute.arch.mul_packed_f32x2(values, (alpha_val, alpha_val))
+            relu = (
+                cute.arch.fmax(values[0], zero),
+                cute.arch.fmax(values[1], zero),
+            )
+            squared = cute.arch.mul_packed_f32x2(relu, relu)
+            out[i] = squared[0]
+            out[i + 1] = squared[1]
         return out
 
     @cute.jit
