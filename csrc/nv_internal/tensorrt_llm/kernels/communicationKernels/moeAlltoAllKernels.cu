@@ -56,6 +56,18 @@ static_assert(kCompactDispatchMaxPayloadBytes / kDispatchWideVectorBytes <=
               kDispatchActivationWarps * kDispatchWarpSize);
 static_assert(kCompactDispatchBlockSize == (kDispatchActivationWarps + 2) * kDispatchWarpSize);
 
+static int getDiagnosticEp8DynamicSmemBytes() {
+  static int const kDynamicSmemBytes = [] {
+    int const value =
+        tensorrt_llm::common::getIntEnv("TLLM_MOE_A2A_EP8_COMPACT_DYNAMIC_SMEM_BYTES").value_or(0);
+    FLASHINFER_CHECK(value >= 0 && value <= 47 * 1024 && value % 256 == 0,
+                     "TLLM_MOE_A2A_EP8_COMPACT_DYNAMIC_SMEM_BYTES must be a multiple of 256 in "
+                     "[0, 48128]");
+    return value;
+  }();
+  return kDynamicSmemBytes;
+}
+
 #ifndef DISABLE_TIMEOUT
 #define DISABLE_TIMEOUT 0
 #endif
@@ -845,6 +857,10 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                                    params.eplb_stats_num_experts, params.enable_pdl);
         } else if (params.ep_size == kEp8Size) {
           int shared_bytes = kEp8Size * (int)sizeof(int);
+          int const diagnostic_shared_bytes = getDiagnosticEp8DynamicSmemBytes();
+          if (diagnostic_shared_bytes > shared_bytes) {
+            shared_bytes = diagnostic_shared_bytes;
+          }
           auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, kEp8Size, true>;
           launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
                                    block_size, shared_bytes, params.stream,
