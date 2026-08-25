@@ -3,7 +3,7 @@
 NVFP4 counterpart of ``test_mxfp8_cutedsl_preprocess_vs_reference.py``: validates
 that ``sm100_nvfp4_nvfp4_bf16_cutedsl.preprocess_mega_weights`` produces fp4 weights consistent
 with an independent plain quant, and that a single-rank ``nvfp4_mega_moe``
-launch matches a pure-torch dequant reference (fp32 GEMMs + SwiGLU + fc1-out
+launch matches a pure-torch dequant reference (fp32 GEMMs + FC1 activation +
 NVFP4 round-trip) after the in-kernel top-k reduction.
 
 The torch oracle here is intentionally independent of the CuTeDSL-backed
@@ -39,13 +39,20 @@ def _require_cuda():
         pytest.skip("needs CUDA")
 
 
-def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=4):
+def _single_rank_problem(
+    hidden=2048,
+    intermediate=1024,
+    *,
+    num_experts=4,
+    topk=4,
+    activation="swiglu",
+):
     import torch
 
     num_tokens = 32
     max_tokens = 64
     num_local_experts = num_experts
-    gate_up_clamp = 10.0
+    gate_up_clamp = 10.0 if activation == "swiglu" else None
 
     g = torch.Generator(device="cuda").manual_seed(7)
     hidden_states = torch.randn(
@@ -61,7 +68,7 @@ def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=
     g = torch.Generator(device="cuda").manual_seed(13)
     w13 = torch.randn(
         num_local_experts,
-        2 * intermediate,
+        intermediate * (2 if activation == "swiglu" else 1),
         hidden,
         dtype=torch.bfloat16,
         device="cuda",
@@ -83,6 +90,7 @@ def _single_rank_problem(hidden=2048, intermediate=1024, *, num_experts=4, topk=
         max_tokens=max_tokens,
         num_experts=num_experts,
         topk=topk,
+        activation=activation,
         gate_up_clamp=gate_up_clamp,
         hidden_states=hidden_states,
         topk_weights=topk_weights.to(torch.float32),
@@ -157,15 +165,18 @@ def _plain_nvfp4_from_bf16(problem: dict):
     num_experts = problem["w13"].shape[0]
     norm_const = 1.0
 
-    w13_interleaved = _interleave_gate_up_16(
-        problem["w13"], intermediate_size=intermediate
-    )
+    if problem["activation"] == "swiglu":
+        w13_kernel = _interleave_gate_up_16(
+            problem["w13"], intermediate_size=intermediate
+        )
+    else:
+        w13_kernel = problem["w13"]
 
     fc1_weights, fc1_plain_sf = [], []
     fc2_weights, fc2_plain_sf = [], []
     for expert in range(num_experts):
         fc1_q, fc1_sf = nvfp4_quantize_per_block_16(
-            w13_interleaved[expert].to(torch.float32), norm_const
+            w13_kernel[expert].to(torch.float32), norm_const
         )
         fc1_weights.append(fc1_q)
         fc1_plain_sf.append(fc1_sf)
@@ -196,6 +207,7 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    activation="swiglu",
     term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
@@ -232,32 +244,35 @@ def _torch_nvfp4_mega_reference(
 
         fc1_w = _dequant_nvfp4(
             fc1_weight[expert], fc1_sf[expert], logical_cols=hidden
-        )  # (2I, hidden)
-        fc1_out = act_fp32[tokens] @ fc1_w.transpose(0, 1)  # (R, 2I)
+        )  # (physical FC1 width, hidden)
+        fc1_out = act_fp32[tokens] @ fc1_w.transpose(0, 1)
 
-        # SwiGLU over the 16-column gate/up interleave used by the NVFP4 kernel.
-        m = fc1_out.shape[0]
-        n_pairs = fc1_out.shape[1] // (2 * NVFP4_BLOCK)
-        reshaped = fc1_out.view(m, n_pairs, 2, NVFP4_BLOCK)
-        gate = reshaped[:, :, 0, :]
-        up = reshaped[:, :, 1, :]
-        if gate_up_clamp is not None:
-            limit = abs(float(gate_up_clamp))
-            gate = gate.clamp(max=limit)
-            up = up.clamp(min=-limit, max=limit)
-        swiglu = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
+        if activation == "swiglu":
+            # SwiGLU over the 16-column gate/up interleave used by the kernel.
+            m = fc1_out.shape[0]
+            n_pairs = fc1_out.shape[1] // (2 * NVFP4_BLOCK)
+            reshaped = fc1_out.view(m, n_pairs, 2, NVFP4_BLOCK)
+            gate = reshaped[:, :, 0, :]
+            up = reshaped[:, :, 1, :]
+            if gate_up_clamp is not None:
+                limit = abs(float(gate_up_clamp))
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            activated = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
+        else:
+            activated = torch.relu(fc1_out).square()
 
         # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
         # (post-hoc weighting would NOT match — quant changes the magnitude).
-        swiglu = swiglu * topk_weights[tokens, slots].unsqueeze(-1)
+        activated = activated * topk_weights[tokens, slots].unsqueeze(-1)
 
-        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(swiglu, 1.0)
-        swiglu_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
+        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(activated, 1.0)
+        activated_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
 
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = activated_rt @ fc2_w.transpose(0, 1)
         if term_transform is not None:
             fc2_out = term_transform(fc2_out)
         out[tokens, slots] = fc2_out
@@ -334,18 +349,19 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant():
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "hidden,intermediate,num_experts,topk",
+    "hidden,intermediate,num_experts,topk,activation",
     [
-        pytest.param(2048, 1024, 4, 4, id="regular-e4"),
+        pytest.param(2048, 1024, 4, 4, "swiglu", id="regular-e4"),
         # 128-misaligned (hidden % 128 == 64): exercises the ceil-div K-tail
         # and predicated epilogue paths the %64 validation relaxation opened
         # up (gpt-oss-120b geometry class).
-        pytest.param(2880, 2880, 4, 4, id="tail-e4"),
-        pytest.param(2048, 1024, 1, 1, id="singleton-e1"),
+        pytest.param(2880, 2880, 4, 4, "swiglu", id="tail-e4"),
+        pytest.param(2048, 1024, 1, 1, "swiglu", id="singleton-e1"),
+        pytest.param(2048, 1024, 4, 4, "relu2", id="relu2-e4"),
     ],
 )
 def test_nvfp4_kernel_matches_torch_reference(
-    monkeypatch, hidden, intermediate, num_experts, topk
+    monkeypatch, hidden, intermediate, num_experts, topk, activation
 ):
     """Single-rank ``nvfp4_mega_moe`` output matches the pure-torch oracle."""
     _require_cuda()
@@ -379,6 +395,7 @@ def test_nvfp4_kernel_matches_torch_reference(
         intermediate=intermediate,
         num_experts=num_experts,
         topk=topk,
+        activation=activation,
     )
     rank = 0
     world_size = 1
@@ -389,22 +406,26 @@ def test_nvfp4_kernel_matches_torch_reference(
         pack,
         intermediate_size=problem["intermediate"],
         hidden_size=problem["hidden"],
+        activation=problem["activation"],
         gate_up_clamp=problem["gate_up_clamp"],
     )
 
     fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(problem)
 
-    # NOTE: the nvfp4 shim's ``intermediate`` is the fc1 output width (2*I),
-    # matching the backend's ``2 * intermediate_size`` convention.
+    # The shim's ``intermediate`` is the physical FC1 projection width.
+    fc1_output_size = problem["intermediate"] * (
+        2 if problem["activation"] == "swiglu" else 1
+    )
     symm_buffer = get_symm_buffer_for_mega_moe(
         problem["num_experts"],
         problem["max_tokens"],
         problem["topk"],
         problem["hidden"],
-        2 * problem["intermediate"],
+        fc1_output_size,
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
+        activation=problem["activation"],
     )
     try:
         stage_mega_moe_inputs(
@@ -429,6 +450,7 @@ def test_nvfp4_kernel_matches_torch_reference(
             hidden=problem["hidden"],
             intermediate=problem["intermediate"],
             gate_up_clamp=problem["gate_up_clamp"],
+            activation=problem["activation"],
         )
 
         y_kernel = torch.empty(

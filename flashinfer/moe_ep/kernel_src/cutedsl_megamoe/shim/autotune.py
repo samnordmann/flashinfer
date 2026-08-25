@@ -266,7 +266,7 @@ def autotune_nvfp4_mega_moe(
 
             record_knobs(
                 winner,
-                dtype="nvfp4",
+                dtype=("nvfp4" if cfg.activation == "swiglu" else "nvfp4_relu2"),
                 world_size=cfg.world_size,
                 hidden=cfg.hidden,
                 intermediate=cfg.intermediate,

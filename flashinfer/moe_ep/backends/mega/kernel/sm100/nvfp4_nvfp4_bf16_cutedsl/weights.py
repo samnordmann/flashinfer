@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Literal, Tuple
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
@@ -104,6 +104,7 @@ def preprocess_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
@@ -115,6 +116,15 @@ def preprocess_mega_weights(
     from ......kernel_src.cutedsl_megamoe import (
         _stack_byte_reinterpretable_tensors,
     )
+
+    if activation not in ("swiglu", "relu2"):
+        raise ValueError(f"activation must be 'swiglu' or 'relu2'; got {activation!r}.")
+    if activation == "relu2" and (
+        gate_up_clamp is not None or activation_clamp is not None
+    ):
+        raise ValueError(
+            "gate_up_clamp and activation_clamp are only valid for activation='swiglu'."
+        )
 
     # Reject conflicting clamp aliases; the clamp itself is a kernel-side
     # nonlinearity parameter and must NOT scale the weight quantization.
@@ -129,7 +139,7 @@ def preprocess_mega_weights(
     # diverged from the pre-quantized-weights path below, which consumes
     # caller scales verbatim.
     norm_const = 1.0
-    fc1_out = 2 * intermediate_size
+    fc1_out = intermediate_size * (2 if activation == "swiglu" else 1)
     num_experts = weights.w13.shape[0]
 
     logical_w13_shape = (num_experts, fc1_out, hidden_size)
@@ -178,10 +188,16 @@ def preprocess_mega_weights(
                 f"w2_scale must have shape {expected_w2_scale_shape}, "
                 f"got {tuple(weights.w2_scale.shape)}"
             )
-        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
-        w13_scale = _interleave_gate_up_16(
-            weights.w13_scale, intermediate_size=intermediate_size
-        )
+        if activation == "swiglu":
+            w13 = _interleave_gate_up_16(
+                weights.w13, intermediate_size=intermediate_size
+            )
+            w13_scale = _interleave_gate_up_16(
+                weights.w13_scale, intermediate_size=intermediate_size
+            )
+        else:
+            w13 = weights.w13.contiguous()
+            w13_scale = weights.w13_scale.contiguous()
         # Keep the transpose as a view so the kernel's K axis remains stride-1.
         # Materializing the logical (E, K, N) view would make N stride-1.
         fc1_weight = _as_fp4_weight(w13.transpose(1, 2))
@@ -206,7 +222,12 @@ def preprocess_mega_weights(
             raise ValueError(
                 f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
             )
-        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
+        if activation == "swiglu":
+            w13 = _interleave_gate_up_16(
+                weights.w13, intermediate_size=intermediate_size
+            )
+        else:
+            w13 = weights.w13.contiguous()
         for expert in range(num_experts):
             fc1_q, fc1_sf = _quantize_expert_weights(
                 w13[expert],
@@ -269,6 +290,7 @@ def validate_transformed_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     world_size: int,
     num_experts: int,
 ) -> None:
@@ -288,9 +310,14 @@ def validate_transformed_mega_weights(
             f"num_experts ({num_experts}) must be divisible by world_size ({world_size})"
         )
 
+    if activation not in ("swiglu", "relu2"):
+        raise MoEEpConfigError(
+            f"activation must be 'swiglu' or 'relu2'; got {activation!r}."
+        )
+
     local_experts = num_experts // world_size
     i_down = intermediate_size // 2
-    fc1_out = 2 * intermediate_size
+    fc1_out = intermediate_size * (2 if activation == "swiglu" else 1)
     weight_dtype = _nvfp4_kernel_weight_dtype()
 
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly).

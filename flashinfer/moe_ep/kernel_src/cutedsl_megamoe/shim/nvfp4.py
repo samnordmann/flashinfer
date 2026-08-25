@@ -1086,7 +1086,7 @@ def get_symm_buffer_for_mega_moe(
         resolved_knobs, knob_source = dict(knobs), "explicit"
     else:
         resolved_knobs, knob_source = resolve_knobs(
-            dtype="nvfp4",
+            dtype="nvfp4" if activation == "swiglu" else "nvfp4_relu2",
             world_size=world_size,
             hidden=hidden,
             intermediate=intermediate,
@@ -1396,6 +1396,8 @@ def _create_dummy_weights(
     hidden: int,
     intermediate: int,
     generator: torch.Generator,
+    *,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
 ) -> Tuple[TransformedWeights, TransformedWeights]:
     """Random NVFP4 weights + swizzled SF for local smoke scripts."""
     from moe_nvfp4_swapab.mega_runner import (
@@ -1407,7 +1409,7 @@ def _create_dummy_weights(
         to_blocked,
     )
 
-    intermediate_down = intermediate // 2
+    intermediate_down = intermediate // (2 if activation == "swiglu" else 1)
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     intermediate_down_sf_cols = ceil_div(intermediate_down, Nvfp4BlockSize)
 
@@ -1466,6 +1468,7 @@ def create_dummy_inputs(
     hidden: int,
     intermediate: int,
     *,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1516,6 +1519,7 @@ def create_dummy_inputs(
         rank,
         world_size,
         gate_up_clamp=clamp,
+        activation=activation,
         combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,
         fc2_alpha=fc2_alpha,
@@ -1527,6 +1531,7 @@ def create_dummy_inputs(
         hidden,
         intermediate,
         gen,
+        activation=activation,
     )
 
     from moe_nvfp4_swapab.runner_common import (
@@ -1534,7 +1539,7 @@ def create_dummy_inputs(
         make_raw_scale_tensor_from_torch_rng,
     )
 
-    activation = make_nvfp4_tensor_from_torch_rng(
+    activation_tensor = make_nvfp4_tensor_from_torch_rng(
         gen,
         (num_tokens, hidden),
         packed_dim=-1,
@@ -1562,7 +1567,7 @@ def create_dummy_inputs(
         sorted=False,
     )
 
-    symm_buffer.x[:num_tokens].copy_(activation)
+    symm_buffer.x[:num_tokens].copy_(activation_tensor)
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     symm_buffer.x_sf[:num_tokens, :hidden_sf_cols].copy_(activation_sf)
     symm_buffer.topk_idx[:num_tokens].copy_(topk_idx.to(torch.int64))

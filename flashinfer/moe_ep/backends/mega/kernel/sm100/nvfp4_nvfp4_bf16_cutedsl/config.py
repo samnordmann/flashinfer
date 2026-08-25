@@ -46,3 +46,22 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    activation: Literal["swiglu", "relu2"] = "swiglu"
+
+    def __post_init__(self) -> None:
+        if self.activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2'; got {self.activation!r}."
+            )
+        if self.activation == "relu2" and (
+            self.gate_up_clamp is not None or self.activation_clamp is not None
+        ):
+            raise ValueError(
+                "gate_up_clamp and activation_clamp are only valid for "
+                "activation='swiglu'."
+            )
+
+    @property
+    def fc1_projection_size(self) -> int:
+        """Physical FC1 projection width before the activation."""
+        return self.intermediate_size * (2 if self.activation == "swiglu" else 1)

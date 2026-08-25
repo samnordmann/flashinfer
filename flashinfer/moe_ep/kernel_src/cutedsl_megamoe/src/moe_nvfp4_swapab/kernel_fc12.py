@@ -1131,7 +1131,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         )
         fc1_output_epi_tile = (
             self.epilogue._EpilogueTokenTileSize,
-            self.epilogue._EpilogueFc1IntermediateDownTileSize,
+            self.epilogue.fc1_output_tile_size,
         )
         tma_atom_fc1_output, tma_tensor_fc1_output = cpasync.make_tiled_tma_atom(
             fc1_output_tma_op,

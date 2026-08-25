@@ -42,3 +42,30 @@ def test_relu2_rejects_swiglu_clamp() -> None:
 def test_unknown_activation_is_rejected() -> None:
     with pytest.raises(ValueError, match="activation"):
         _config(activation="gelu")
+
+
+def test_backend_config_uses_one_fc1_projection_for_relu2() -> None:
+    from flashinfer.moe_ep import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=5120,
+        top_k=22,
+        activation="relu2",
+    )
+    assert config.fc1_projection_size == 5120
+
+
+def test_backend_relu2_rejects_swiglu_clamp() -> None:
+    from flashinfer.moe_ep import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    with pytest.raises(ValueError, match="only valid"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=5120,
+            top_k=22,
+            activation="relu2",
+            activation_clamp=10.0,
+        )
