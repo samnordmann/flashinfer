@@ -1052,6 +1052,18 @@ class SwapABSwigluFp4Epilogue:
             self._EpilogueFc1IntermediateGateUpTileSize
             // self.fc1_output_divisor
         )
+        fc1_output_contiguous_bits = (
+            self.fc1_output_tile_size * self.fc1_output_dtype.width
+        )
+        if fc1_output_contiguous_bits == 256:
+            self.fc1_smem_swizzle_b = 1
+        elif fc1_output_contiguous_bits == 512:
+            self.fc1_smem_swizzle_b = 2
+        else:
+            raise NotImplementedError(
+                "FC1 epilogue supports only 32B or 64B contiguous SMEM "
+                f"tiles; got {fc1_output_contiguous_bits} bits."
+            )
         # Done-counter publish batch granularity
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
@@ -1310,7 +1322,7 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         self.smem_tensor = cute.make_tensor(
             cute.recast_ptr(
                 epi_smem_storage.epi_smem.data_ptr(),
-                cute.make_swizzle(1, 4, 3),
+                cute.make_swizzle(base.fc1_smem_swizzle_b, 4, 3),
                 dtype=base.fc1_output_dtype,
             ),
             base.fc1_staged_smem_layout(base.subtile_cnt).outer,
