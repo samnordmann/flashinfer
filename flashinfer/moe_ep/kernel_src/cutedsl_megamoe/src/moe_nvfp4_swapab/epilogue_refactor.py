@@ -1648,19 +1648,30 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 token_0_32_tmem_trans.from_r1_perm_until_last_store()
             )
             if cutlass.const_expr(topk_scores is not None):
-                token_0_32_topk_scores = (topk_scores[0], topk_scores[0])
+                token_0_32_topk_score = topk_scores[0]
             else:
-                token_0_32_topk_scores = None
-            self.nvfp4_quant(
+                token_0_32_topk_score = None
+            self.nvfp4_quant_relu2_block(
                 work_tile_info=work_tile_info,
-                two_token=(token_0_32_block_0, token_0_32_block_1),
-                topk_scores=token_0_32_topk_scores,
+                token=token_0_32_block_0,
+                topk_score=token_0_32_topk_score,
                 norm_const=norm_const,
                 intermediate_output_size=cute.size(fc1_output, 1),
                 fc1_output_sf=fc1_output_sf,
                 subtile_idx=subtile_idx,
-                token_offsets=(0, 0),
-                output_offsets=(0, self.fc1_output_tile_size // 2),
+                token_offset=0,
+                output_block_in_warp=0,
+            )
+            self.nvfp4_quant_relu2_block(
+                work_tile_info=work_tile_info,
+                token=token_0_32_block_1,
+                topk_score=token_0_32_topk_score,
+                norm_const=norm_const,
+                intermediate_output_size=cute.size(fc1_output, 1),
+                fc1_output_sf=fc1_output_sf,
+                subtile_idx=subtile_idx,
+                token_offset=0,
+                output_block_in_warp=1,
             )
 
             token_32_64_tmem_trans = TmemTranspose32x32Inplace(
@@ -1672,19 +1683,30 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
                 token_32_64_tmem_trans.from_r1_perm_until_last_store()
             )
             if cutlass.const_expr(topk_scores is not None):
-                token_32_64_topk_scores = (topk_scores[1], topk_scores[1])
+                token_32_64_topk_score = topk_scores[1]
             else:
-                token_32_64_topk_scores = None
-            self.nvfp4_quant(
+                token_32_64_topk_score = None
+            self.nvfp4_quant_relu2_block(
                 work_tile_info=work_tile_info,
-                two_token=(token_32_64_block_0, token_32_64_block_1),
-                topk_scores=token_32_64_topk_scores,
+                token=token_32_64_block_0,
+                topk_score=token_32_64_topk_score,
                 norm_const=norm_const,
                 intermediate_output_size=cute.size(fc1_output, 1),
                 fc1_output_sf=fc1_output_sf,
                 subtile_idx=subtile_idx,
-                token_offsets=(32, 32),
-                output_offsets=(0, self.fc1_output_tile_size // 2),
+                token_offset=32,
+                output_block_in_warp=0,
+            )
+            self.nvfp4_quant_relu2_block(
+                work_tile_info=work_tile_info,
+                token=token_32_64_block_1,
+                topk_score=token_32_64_topk_score,
+                norm_const=norm_const,
+                intermediate_output_size=cute.size(fc1_output, 1),
+                fc1_output_sf=fc1_output_sf,
+                subtile_idx=subtile_idx,
+                token_offset=32,
+                output_block_in_warp=1,
             )
 
         # Step 3: TMASTG
@@ -1911,13 +1933,10 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         intermediate_output_size: cutlass.Int32,
         fc1_output_sf: cute.Tensor,  # MoE domain (token_this_rank, intermediate_down, 1)
         subtile_idx: cutlass.Int32,
-        token_offsets: Tuple[int, int] = (0, 32),
-        output_offsets: Tuple[int, int] = (0, 0),
     ):
-        # Each input is one transposed 16-value NVFP4 block. The compile-time
-        # maps select its token row and channel offset. SwiGLU uses the defaults
-        # (two token halves, one channel block); ReLU2 maps the two accumulator
-        # fragments to the lower and upper 64-channel halves of the same token.
+        # ``two_token`` are the two post-swiglu, transposed token rmem tensors;
+        # each lane holds one token's ``sf_vec_size`` (=16, one NVFP4 SF block)
+        # intermediate-output values. half 0 -> token lane, half 1 -> lane+32.
         #
         # Per token (ported from PostSwigluHalf._gen_sfc_quantize + stg_sfc + r2s):
         #   1. (Path A) pre-multiply topk weight into the values, if present.
@@ -1937,13 +1956,17 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
         # the sfc store, and the STS.64 into the shared output stage.
         quant = QuantImpl("nvfp4", "regs_in_thread")
 
+        intermediate_idx = (
+            work_tile_info.tile_m_idx * self.fc1_output_tile_size
+            + self.warp_idx * Nvfp4BlockSize
+        )
         subtile_token_start = (
             work_tile_info.tile_n_idx * self.cta_tile_n
             + subtile_idx * self._EpilogueTokenTileSize
         )
         token_idx_pair = (
-            subtile_token_start + self.lane_idx + token_offsets[0],
-            subtile_token_start + self.lane_idx + token_offsets[1],
+            subtile_token_start + self.lane_idx,
+            subtile_token_start + self.lane_idx + 32,
         )
 
         # This subtile's (token, intermediate) shared output stage, tiled into
@@ -1961,12 +1984,6 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
 
         for half in cutlass.range_constexpr(2):
             tok = two_token[half]
-            output_offset = output_offsets[half]
-            intermediate_idx = (
-                work_tile_info.tile_m_idx * self.fc1_output_tile_size
-                + output_offset
-                + self.warp_idx * Nvfp4BlockSize
-            )
 
             # 1) topk-weight pre-multiply (Path A) into a weighted scratch.
             weighted = cute.make_rmem_tensor((n,), cutlass.Float32)
@@ -2000,17 +2017,81 @@ class SwapABFc1Epilogue(_ImmutableAfterInit):
             # 4) STS.64 the e2m1 into this subtile's shared output stage.
             # ((1, 16), (token_tile_size, warp_cnt)) -> (16)
             smem_thread_row = smem_tiled[
-                (0, None),
-                (
-                    self.lane_idx + token_offsets[half],
-                    self.warp_idx + output_offset // Nvfp4BlockSize,
-                ),
+                (0, None), (self.lane_idx + 32 * half, self.warp_idx)
             ]
             cute.copy(
                 fp4_copy_atom,
                 cute.coalesce(fp4_regs),
                 cute.coalesce(smem_thread_row),
             )
+
+    @cute.jit
+    def nvfp4_quant_relu2_block(
+        self,
+        work_tile_info: MoEWorkTileInfo,
+        token: cute.Tensor,
+        topk_score: Optional[cutlass.Float32],
+        norm_const: Optional[cutlass.Float32],
+        intermediate_output_size: cutlass.Int32,
+        fc1_output_sf: cute.Tensor,
+        subtile_idx: cutlass.Int32,
+        token_offset: int,
+        output_block_in_warp: int,
+    ):
+        """Quantize and place one independent ReLU2 16-channel block."""
+        n = cute.size(token)
+        weighted = cute.make_rmem_tensor((n,), cutlass.Float32)
+        if cutlass.const_expr(topk_score is not None):
+            score_pair = (topk_score, topk_score)
+            for i in cutlass.range_constexpr(0, n, 2):
+                w0, w1 = cute.arch.mul_packed_f32x2(
+                    (token[i], token[i + 1]), score_pair
+                )
+                weighted[i] = w0
+                weighted[i + 1] = w1
+        else:
+            for i in cutlass.range_constexpr(0, n):
+                weighted[i] = token[i]
+
+        fp4_regs, sfc_regs = QuantImpl("nvfp4", "regs_in_thread")(
+            weighted, norm_const=norm_const
+        )
+        output_block = self.warp_idx * 2 + output_block_in_warp
+        intermediate_idx = (
+            work_tile_info.tile_m_idx * self.fc1_output_tile_size
+            + output_block * Nvfp4BlockSize
+        )
+        token_idx = (
+            work_tile_info.tile_n_idx * self.cta_tile_n
+            + subtile_idx * self._EpilogueTokenTileSize
+            + self.lane_idx
+            + token_offset
+        )
+        if cutlass.const_expr(
+            self.static_expert_shape is None
+            or self.intermediate_downproj % self.cluster_tile_intermediate_downproj
+            != 0
+        ):
+            if intermediate_idx < intermediate_output_size:
+                fc1_output_sf[token_idx, intermediate_idx, 0] = sfc_regs[0]
+        else:
+            fc1_output_sf[token_idx, intermediate_idx, 0] = sfc_regs[0]
+
+        smem_stage = self.smem_tensor[None, None, subtile_idx]
+        smem_tiled = cute.zipped_divide(smem_stage, (1, Nvfp4BlockSize))
+        smem_thread_row = smem_tiled[
+            (0, None),
+            (self.lane_idx + token_offset, output_block),
+        ]
+        cute.copy(
+            cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float4E2M1FN,
+                num_bits_per_copy=64,
+            ),
+            cute.coalesce(fp4_regs),
+            cute.coalesce(smem_thread_row),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
