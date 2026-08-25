@@ -36,6 +36,7 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 
 constexpr int kEp4Size = 4;
 constexpr int kEp8Size = 8;
+constexpr int kCompactEp8MaxLocalTokens = 64;
 // Two 32-thread warps can cover at most 64 16-byte activation vectors.
 constexpr int kCompactDispatchMaxPayloadBytes = 1024;
 constexpr int kCompactDispatchBlockSize = 128;
@@ -843,7 +844,8 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                                    params.max_tokens_per_rank, params.local_num_tokens,
                                    params.ep_rank, params.ep_size, params.num_experts,
                                    params.eplb_stats_num_experts, params.enable_pdl);
-        } else if (params.ep_size == kEp8Size) {
+        } else if (params.ep_size == kEp8Size &&
+                   params.local_num_tokens <= kCompactEp8MaxLocalTokens) {
           int shared_bytes = kEp8Size * (int)sizeof(int);
           auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, kEp8Size, true>;
           launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
