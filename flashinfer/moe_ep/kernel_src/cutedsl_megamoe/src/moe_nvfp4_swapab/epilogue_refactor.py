@@ -1012,6 +1012,7 @@ class SwapABSwigluFp4Epilogue:
             Tuple[int, int, int]
         ] = None,  # [expert, intermediate, hidden]
         gate_up_clamp: Optional[float] = None,  # Swiglu style only
+        activation: Literal["swiglu", "relu2"] = "swiglu",
         epi_flag_batch: Optional[Tuple[int, int]] = (
             1,
             1,
@@ -1023,6 +1024,14 @@ class SwapABSwigluFp4Epilogue:
                 f"sC is NVFP4 Float4E2M1FN; got {fc1_output_dtype}. "
                 "Changing this dtype requires redesigning the fixed 8KB "
                 "shared epilogue scratch layout."
+            )
+        if activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2'; got {activation!r}."
+            )
+        if activation == "relu2":
+            raise NotImplementedError(
+                "The ReLU2 FC1 epilogue is not implemented in this milestone."
             )
         if token_back_by_dispatch and not non_ubulk_fc2_store:
             raise ValueError(
@@ -1042,6 +1051,8 @@ class SwapABSwigluFp4Epilogue:
         self.sf_vec_size = sf_vec_size
         # Swiglu gate/up clamp limit; None disables clamping.
         self.gate_up_clamp = gate_up_clamp
+        self.activation = activation
+        self.fc1_output_divisor = 2 if activation == "swiglu" else 1
         # Done-counter publish batch granularity
         _fc1_eb, _fc2_eb = (1, 1) if epi_flag_batch is None else epi_flag_batch
         self.fc1_epi_flag_batch = max(1, min(32, int(_fc1_eb)))
@@ -1072,7 +1083,9 @@ class SwapABSwigluFp4Epilogue:
             self.fc2_hidden_needs_predicate: bool = True
 
         if static_expert_shape is not None:
-            intermediate_downproj = static_expert_shape[1] // 2
+            intermediate_downproj = (
+                static_expert_shape[1] // self.fc1_output_divisor
+            )
             self.intermediate_downproj: Optional[int] = intermediate_downproj
         else:
             self.intermediate_downproj: Optional[int] = None

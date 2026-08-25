@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel for SM100."""
+"""Fused fc1+fc2 swap-AB NVFP4 kernel for SM100."""
 
 from typing import Literal, Optional, Tuple, Type
 
@@ -90,6 +90,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         token_back_by_dispatch: bool = False,
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
+        activation: Literal["swiglu", "relu2"] = "swiglu",
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
     ) -> None:
         if not force_static_sched:
@@ -112,6 +113,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 f"load_balance_mode must be 'static' or 'atomic_counter'; "
                 f"got {load_balance_mode!r}."
             )
+        if activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2'; got {activation!r}."
+            )
+        if activation == "relu2" and gate_up_clamp is not None:
+            raise ValueError("gate_up_clamp is only valid for activation='swiglu'.")
 
         self.acc_dtype = acc_dtype
         self.mma_tiler_mnk = mma_tiler_mnk
@@ -138,6 +145,8 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.token_back_by_dispatch = token_back_by_dispatch
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = gate_up_clamp
+        self.activation = activation
+        self.fc1_output_divisor = 2 if activation == "swiglu" else 1
         self.epi_flag_batch = epi_flag_batch
 
         self._validate_mma_tiler_and_cluster_shape()
@@ -218,6 +227,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_expert_shape_{exp}_grouphint_{self.group_hint}"
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_{apply_topk}"
+            f"_activation_{self.activation}"
             f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
         )
@@ -391,6 +401,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             allow_overlap_acc=True,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
+            activation=self.activation,
         )
 
         if self.num_sched_stages is None:
@@ -575,7 +586,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
 
         data_total_rows, _hidden = fc1_activation_tensor.shape
         experts, _hidden_w, intermediate_gateup = fc1_weight_tensor.shape
-        intermediate_downproj = intermediate_gateup // 2
+        intermediate_downproj = intermediate_gateup // self.fc1_output_divisor
 
         # Conservative upper bound for sf_total_rows.
         sf_total_rows_upper = data_total_rows + experts * sf_padding_block
@@ -788,7 +799,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 intermediate_gateup_static,
                 hidden_static,
             ) = self.static_expert_shape
-            intermediate_downproj_static = intermediate_gateup_static // 2
+            intermediate_downproj_static = (
+                intermediate_gateup_static // self.fc1_output_divisor
+            )
 
             fc1_weight = cute.make_tensor(
                 fc1_weight.iterator,

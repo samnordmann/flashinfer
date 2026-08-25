@@ -107,6 +107,7 @@ class MegaMoENvfp4Config:
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
+    activation: Literal["swiglu", "relu2"] = "swiglu"
     enable_iket: bool = False
 
     def __post_init__(self) -> None:
@@ -123,6 +124,12 @@ class MegaMoENvfp4Config:
             )
         if self.num_topk <= 0:
             raise ValueError(f"num_topk must be positive, got {self.num_topk}.")
+        if self.activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2'; got {self.activation!r}."
+            )
+        if self.activation == "relu2" and self.gate_up_clamp is not None:
+            raise ValueError("gate_up_clamp is only valid for activation='swiglu'.")
         if self.num_total_experts % self.world_size != 0:
             raise ValueError(
                 "num_total_experts must be divisible by world_size "
@@ -189,6 +196,11 @@ class MegaMoENvfp4Config:
     @property
     def num_experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
+
+    @property
+    def intermediate_output(self) -> int:
+        """Width consumed by FC2 after the compile-time FC1 activation."""
+        return self.intermediate // (2 if self.activation == "swiglu" else 1)
 
     @property
     def fc2_reduces_topk(self) -> bool:
@@ -441,6 +453,7 @@ class MegaMoENvfp4Frontend:
             c.combine_dtype,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
+            c.activation,
             c.enable_iket,
         )
 
@@ -500,6 +513,7 @@ class MegaMoENvfp4Frontend:
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
+            activation=c.activation,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
@@ -632,7 +646,7 @@ class MegaMoENvfp4Frontend:
                 f"({c.num_tokens_per_rank})."
             )
 
-        intermediate_down = c.intermediate // 2
+        intermediate_down = c.intermediate_output
         e = c.num_experts_per_rank
 
         current_device = torch.cuda.current_device()
@@ -963,6 +977,7 @@ class MegaMoESymmBuffer:
     num_topk: int
     hidden: int
     intermediate: int
+    activation: Literal["swiglu", "relu2"]
     rank: int
     world_size: int
 
@@ -1005,6 +1020,7 @@ def get_symm_buffer_for_mega_moe(
     *,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     apply_topk_in_fc1: bool = True,
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1095,6 +1111,7 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         gate_up_clamp=clamp,
+        activation=activation,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
@@ -1164,6 +1181,7 @@ def get_symm_buffer_for_mega_moe(
         num_topk=num_topk,
         hidden=hidden,
         intermediate=intermediate,
+        activation=activation,
         rank=rank,
         world_size=world_size,
         x=x,
