@@ -46,6 +46,10 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    # Optional runtime tactic buckets: (inclusive max live tokens, knobs).
+    # Profiles share one protocol workspace and may be selected independently
+    # by each EP rank. The final limit must match max_tokens_per_rank.
+    knob_profiles: tuple[tuple[int, dict], ...] | None = None
     activation: Literal["swiglu", "relu2"] = "swiglu"
 
     def __post_init__(self) -> None:
@@ -60,6 +64,8 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
                 "gate_up_clamp and activation_clamp are only valid for "
                 "activation='swiglu'."
             )
+        if self.knobs == "auto" and self.knob_profiles:
+            raise ValueError("knobs='auto' is incompatible with knob_profiles")
 
     @property
     def fc1_projection_size(self) -> int:

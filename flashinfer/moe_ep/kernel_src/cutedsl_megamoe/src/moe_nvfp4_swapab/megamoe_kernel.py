@@ -935,6 +935,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             "standalone_warps": "standalone",
             "reuse_dispatch_warps": "reuse_dispatch",
         }.get(self.token_back_mode, self.token_back_mode)
+        workspace_layout = getattr(self, "_workspace_layout_tag", None)
         return (
             "megamoe_nvfp4"
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
@@ -947,6 +948,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             # MegaMoE-specific constexpr:
             f"_ep_{self.world_size}_topk_{self.num_topk}_maxtoken_{self.max_tokens_per_rank}"
             f"_flagbatch_{self.flag_batch}"
+            + (f"_wslayout_{workspace_layout}" if workspace_layout else "")
         )
 
     # -- AOT compile / load (TVM-FFI calling convention) ----------------------

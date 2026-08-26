@@ -41,10 +41,11 @@ Single-rank smoke (no NVSHMEM)::
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional, Tuple, Union
 
 import torch
 
@@ -238,14 +239,173 @@ class MegaMoENvfp4Inputs:
     output_activation: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _CompatibleWorkspaceLayout:
+    local_offsets: dict[str, int]
+    local_total: int
+    shared_offsets: dict[str, int]
+    shared_total: int
+    tag: str
+
+
+def _make_compatible_workspace_layout(
+    kernels: tuple[Any, ...],
+) -> _CompatibleWorkspaceLayout:
+    """Build one physical layout that every tactic can interpret.
+
+    Region shapes remain tactic-local. Only byte offsets and allocation totals
+    are shared, with each slot sized to the largest corresponding region.
+    """
+    if not kernels:
+        raise ValueError("at least one kernel is required")
+
+    def merge(kind: str) -> tuple[dict[str, int], int, tuple]:
+        specs_by_kernel = [
+            getattr(kernel, f"_{kind}_region_by_name") for kernel in kernels
+        ]
+        all_names = set().union(*(specs.keys() for specs in specs_by_kernel))
+        anchors = [
+            kernel
+            for kernel, specs in zip(kernels, specs_by_kernel, strict=False)
+            if set(specs) == all_names
+        ]
+        if not anchors:
+            raise ValueError(
+                f"no {kind} workspace profile contains the union of regions"
+            )
+        ordered_names = [
+            spec.name for spec in getattr(anchors[0], f"_{kind}_region_specs")
+        ]
+
+        offsets: dict[str, int] = {}
+        fingerprint = []
+        cursor = 0
+        for name in ordered_names:
+            specs = [specs[name] for specs in specs_by_kernel if name in specs]
+            if kind == "shared":
+                shared_abis = {
+                    (repr(spec.cute_dtype), tuple(spec.shape), int(spec.nbytes))
+                    for spec in specs
+                }
+                if len(shared_abis) != 1:
+                    raise ValueError(
+                        f"shared workspace region {name!r} has incompatible "
+                        "dtype or shape across profiles"
+                    )
+            align = max(int(spec.align) for spec in specs)
+            slot_bytes = max(int(spec.nbytes) for spec in specs)
+            cursor = ((cursor + align - 1) // align) * align
+            offsets[name] = cursor
+            fingerprint.append((kind, name, cursor, slot_bytes, align))
+            cursor += slot_bytes
+        total = ((cursor + 15) // 16) * 16
+        return offsets, total, tuple(fingerprint)
+
+    local_offsets, local_total, local_fingerprint = merge("local")
+    shared_offsets, shared_total, shared_fingerprint = merge("shared")
+    digest = hashlib.sha256(
+        repr(
+            (
+                local_fingerprint,
+                local_total,
+                shared_fingerprint,
+                shared_total,
+            )
+        ).encode("ascii")
+    ).hexdigest()[:16]
+    return _CompatibleWorkspaceLayout(
+        local_offsets=local_offsets,
+        local_total=local_total,
+        shared_offsets=shared_offsets,
+        shared_total=shared_total,
+        tag=digest,
+    )
+
+
+def _apply_compatible_workspace_layout(
+    kernel: Any,
+    layout: _CompatibleWorkspaceLayout,
+) -> None:
+    kernel._local_offsets = dict(layout.local_offsets)
+    kernel._local_total = layout.local_total
+    kernel._shared_offsets = dict(layout.shared_offsets)
+    kernel._shared_total = layout.shared_total
+    kernel._workspace_layout_tag = layout.tag
+
+    local_leading = layout.local_offsets["l1_token_buffer"]
+    shared_leading = layout.shared_offsets["src_token_topk_idx"]
+    kernel.require_zero_workspace_leading_bytes = (
+        local_leading,
+        shared_leading,
+    )
+    kernel.local_zero_i32_count = local_leading // 4
+    kernel.shared_zero_i32_count = shared_leading // 4
+
+
 class MegaMoENvfp4Frontend:
     """Lazy-compile host wrapper for ``Sm100MegaMoEKernel``."""
 
-    def __init__(self, config: MegaMoENvfp4Config) -> None:
+    _PROFILE_TACTIC_FIELDS = frozenset(
+        {
+            "mma_tiler_mnk",
+            "cluster_shape_mnk",
+            "use_2cta_instrs",
+            "load_balance_mode",
+            "group_hint",
+            "force_static_sched",
+            "clc_bundle_size",
+            "num_sched_stages",
+            "flag_batch",
+            "epi_flag_batch",
+            "token_back_mode",
+        }
+    )
+
+    def __init__(
+        self,
+        config: MegaMoENvfp4Config,
+        *,
+        profile_configs: Optional[Tuple[Tuple[int, MegaMoENvfp4Config], ...]] = None,
+    ) -> None:
         self._config = config
         self._gate_up_clamp = config.gate_up_clamp
+        self._profile_configs = self._validate_profile_configs(config, profile_configs)
+        self._profile_keys: Optional[tuple] = None
+        self._profile_megas: tuple[tuple[int, _CompiledMega], ...] = ()
         self._mega_key: Optional[tuple] = None
         self._mega: Optional[_CompiledMega] = None
+
+    @classmethod
+    def _validate_profile_configs(
+        cls,
+        base: MegaMoENvfp4Config,
+        profiles: Optional[Tuple[Tuple[int, MegaMoENvfp4Config], ...]],
+    ) -> tuple[tuple[int, MegaMoENvfp4Config], ...]:
+        if not profiles:
+            return ()
+        previous_limit = 0
+        validated = []
+        fields = dataclasses.fields(base)
+        for limit, config in profiles:
+            if limit <= previous_limit:
+                raise ValueError("profile token limits must be strictly increasing")
+            if limit > base.num_tokens_per_rank:
+                raise ValueError(
+                    "profile token limits cannot exceed num_tokens_per_rank"
+                )
+            for field_info in fields:
+                name = field_info.name
+                if name in cls._PROFILE_TACTIC_FIELDS:
+                    continue
+                if getattr(config, name) != getattr(base, name):
+                    raise ValueError(
+                        f"profile config may not change protocol field {name!r}"
+                    )
+            validated.append((limit, config))
+            previous_limit = limit
+        if previous_limit != base.num_tokens_per_rank:
+            raise ValueError("the final profile limit must equal num_tokens_per_rank")
+        return tuple(validated)
 
     @property
     def config(self) -> MegaMoENvfp4Config:
@@ -269,6 +429,9 @@ class MegaMoENvfp4Frontend:
         Invalidates the compile cache when the effective config changes; the
         next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
         """
+        if self._profile_configs:
+            raise ValueError("apply_knobs is incompatible with runtime profiles")
+
         from .tuner import with_knobs
 
         new_config = with_knobs(self.config, knobs)
@@ -294,7 +457,8 @@ class MegaMoENvfp4Frontend:
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return None
-        self._ensure_mega_compiled(inputs)
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
+        self._ensure_mega_compiled(inputs, active_num_tokens=resolved)
 
     def run(
         self,
@@ -333,7 +497,7 @@ class MegaMoENvfp4Frontend:
         if resolved == 0 and not preserve_capacity:
             return None
         key = self._launch_cache_key(inputs, resolved, preserve_capacity)
-        mega = self._mega
+        mega = self._select_compiled_profile(resolved)
         if mega is None or mega.compiled is None or mega.launch_key != key:
             # Slow path: full validation + (re)compile + launch-kwargs build.
             # Any config change (apply_knobs / set_gate_up_clamp) nulls
@@ -345,7 +509,7 @@ class MegaMoENvfp4Frontend:
             )
             if launch_inputs is None:
                 return None
-            mega = self._ensure_mega_compiled(inputs)
+            mega = self._ensure_mega_compiled(inputs, active_num_tokens=resolved)
             mega.launch_kwargs = self._build_mega_runtime_kwargs(
                 launch_inputs,
                 mega,
@@ -403,7 +567,7 @@ class MegaMoENvfp4Frontend:
         )
         if launch_inputs is None:
             return lambda: None
-        mega = self._ensure_mega_compiled(inputs)
+        mega = self._ensure_mega_compiled(inputs, active_num_tokens=resolved)
         runtime_kwargs = self._build_mega_runtime_kwargs(
             launch_inputs,
             mega,
@@ -457,8 +621,13 @@ class MegaMoENvfp4Frontend:
     # Compile cache
     # ------------------------------------------------------------------
 
-    def _mega_compile_key(self) -> tuple:
-        c = self.config
+    def _effective_config(self, config: MegaMoENvfp4Config) -> MegaMoENvfp4Config:
+        if self._gate_up_clamp == config.gate_up_clamp:
+            return config
+        return dataclasses.replace(config, gate_up_clamp=self._gate_up_clamp)
+
+    def _mega_compile_key(self, config: Optional[MegaMoENvfp4Config] = None) -> tuple:
+        c = self.config if config is None else self._effective_config(config)
         return (
             c.world_size,
             c.rank,
@@ -487,23 +656,15 @@ class MegaMoENvfp4Frontend:
             c.enable_iket,
         )
 
-    def _ensure_mega_compiled(self, inputs: MegaMoENvfp4Inputs) -> _CompiledMega:
-        key = self._mega_compile_key()
-        if self._mega is not None and self._mega_key == key:
-            return self._mega
-
-        ensure_not_capturing("cute.compile + symmetric-heap allocation")
-        self._release_workspace()
-
+    def _make_kernel(self, config: MegaMoENvfp4Config) -> tuple[Any, int]:
         import cutlass
-        import cutlass.cute as cute
 
         from common.megamoe_constants import SfPaddingBlock
         from moe_nvfp4_swapab.epilogue_refactor import SwapABSwigluFp4Epilogue
         from moe_nvfp4_swapab.megamoe_kernel import Sm100MegaMoEKernel
         from src.token_comm import CombineFormat
 
-        c = self.config
+        c = self._effective_config(config)
         # The kernel now takes a CombineFormat object (was a combine_dtype string)
         # and derives local_rank from the peer mapper (was a ctor arg).
         combine_format = CombineFormat.parse(COMBINE_FORMAT_NAMES[c.combine_dtype])
@@ -542,12 +703,131 @@ class MegaMoENvfp4Frontend:
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
-            gate_up_clamp=self._gate_up_clamp,
+            gate_up_clamp=c.gate_up_clamp,
             activation=c.activation,
             flag_batch=c.flag_batch,
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        return kernel, max_active_clusters
+
+    def _compile_kernel(
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        config: MegaMoENvfp4Config,
+        kernel: Any,
+        max_active_clusters: int,
+        local_workspace: torch.Tensor,
+        shared_workspace: torch.Tensor,
+        symmetric_base: int,
+        peer_offsets_list: tuple[int, ...],
+    ) -> _CompiledMega:
+        import cutlass.cute as cute
+
+        mega = _CompiledMega(
+            compiled=None,
+            kernel=kernel,
+            local_workspace=local_workspace,
+            shared_workspace=shared_workspace,
+            symmetric_base=symmetric_base,
+            peer_offsets_list=peer_offsets_list,
+        )
+        compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
+        compile_kwargs["max_active_clusters"] = max_active_clusters
+        if config.enable_iket:
+            compile_kwargs["options"] = "iket"
+        mega.compiled = cute.compile(kernel, **compile_kwargs)
+        return mega
+
+    def _select_compiled_profile(
+        self, active_num_tokens: int
+    ) -> Optional[_CompiledMega]:
+        if not self._profile_configs:
+            return self._mega
+        for limit, mega in self._profile_megas:
+            if active_num_tokens <= limit:
+                self._mega = mega
+                return mega
+        return None
+
+    def _ensure_profiled_megas_compiled(
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        active_num_tokens: int,
+    ) -> _CompiledMega:
+        keys = tuple(
+            (limit, self._mega_compile_key(config))
+            for limit, config in self._profile_configs
+        )
+        selected = self._select_compiled_profile(active_num_tokens)
+        if selected is not None and self._profile_keys == keys:
+            return selected
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        self._release_workspace()
+        self._invalidate_compile_cache()
+
+        built = [
+            (limit, config, *self._make_kernel(config))
+            for limit, config in self._profile_configs
+        ]
+        kernels = tuple(item[2] for item in built)
+        layout = _make_compatible_workspace_layout(kernels)
+        for kernel in kernels:
+            _apply_compatible_workspace_layout(kernel, layout)
+
+        local_workspace = torch.zeros(
+            (layout.local_total,), dtype=torch.uint8, device="cuda"
+        )
+        shared_workspace = sym_zeros((layout.shared_total,), torch.uint8)
+        symmetric_base, peer_offsets_list = _compute_peer_offsets(
+            shared_workspace,
+            self.config.world_size,
+        )
+
+        compiled_profiles = []
+        for limit, config, kernel, max_active_clusters in built:
+            mega = self._compile_kernel(
+                inputs,
+                config,
+                kernel,
+                max_active_clusters,
+                local_workspace,
+                shared_workspace,
+                symmetric_base,
+                peer_offsets_list,
+            )
+            compiled_profiles.append((limit, mega))
+        self._profile_keys = keys
+        self._profile_megas = tuple(compiled_profiles)
+        selected = self._select_compiled_profile(active_num_tokens)
+        assert selected is not None
+        return selected
+
+    def _ensure_mega_compiled(
+        self,
+        inputs: MegaMoENvfp4Inputs,
+        *,
+        active_num_tokens: Optional[int] = None,
+    ) -> _CompiledMega:
+        if self._profile_configs:
+            resolved = (
+                inputs.activation.shape[0]
+                if active_num_tokens is None
+                else active_num_tokens
+            )
+            return self._ensure_profiled_megas_compiled(inputs, resolved)
+
+        key = self._mega_compile_key()
+        if self._mega is not None and self._mega_key == key:
+            return self._mega
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
+        self._release_workspace()
+        self._invalidate_compile_cache()
+
+        c = self.config
+        kernel, max_active_clusters = self._make_kernel(c)
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -561,20 +841,16 @@ class MegaMoENvfp4Frontend:
             c.world_size,
         )
 
-        mega = _CompiledMega(
-            compiled=None,
-            kernel=kernel,
-            local_workspace=local_workspace,
-            shared_workspace=shared_workspace,
-            symmetric_base=symmetric_base,
-            peer_offsets_list=peer_offsets_list,
+        mega = self._compile_kernel(
+            inputs,
+            c,
+            kernel,
+            max_active_clusters,
+            local_workspace,
+            shared_workspace,
+            symmetric_base,
+            peer_offsets_list,
         )
-        compile_kwargs = self._build_mega_runtime_kwargs(inputs, mega)
-        compile_kwargs["max_active_clusters"] = max_active_clusters
-        if c.enable_iket:
-            compile_kwargs["options"] = "iket"
-
-        mega.compiled = cute.compile(kernel, **compile_kwargs)
         self._mega_key = key
         self._mega = mega
         return self._mega
@@ -591,12 +867,15 @@ class MegaMoENvfp4Frontend:
 
     def _invalidate_compile_cache(self) -> None:
         self._mega_key = None
+        self._profile_keys = None
+        self._profile_megas = ()
         self._mega = None
 
     def _release_workspace(self) -> None:
-        if self._mega is not None:
+        owner = self._profile_megas[0][1] if self._profile_megas else self._mega
+        if owner is not None:
             ensure_not_capturing("workspace release (symmetric-heap free)")
-            free_sym_tensor(self._mega.shared_workspace)
+            free_sym_tensor(owner.shared_workspace)
 
     @staticmethod
     def _resolve_num_tokens(
@@ -1068,6 +1347,7 @@ def get_symm_buffer_for_mega_moe(
     fc2_alpha: Optional[PerExpertEpilogue] = None,
     fc1_norm_const: Optional[PerExpertEpilogue] = None,
     knobs: Optional[dict] = None,
+    knob_profiles: Optional[Tuple[Tuple[int, dict], ...]] = None,
 ) -> MegaMoESymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MegaMoE session.
 
@@ -1099,6 +1379,11 @@ def get_symm_buffer_for_mega_moe(
     fp32 epilogue scalars with shape ``(num_total_experts // world_size,)``.
     Pass a scalar to broadcast one value to all local experts, or pass a CUDA
     float32 tensor with that shape.  When omitted, each defaults to ``1.0``.
+
+    ``knob_profiles`` optionally supplies ``(max_live_tokens, knobs)`` tactics.
+    All tactics compile eagerly against one compatible local/symmetric
+    workspace, so ranks may select different tactics without splitting the
+    peer-visible protocol state. The final limit must equal ``num_max_tokens``.
 
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, scale)`` tuples to :func:`nvfp4_mega_moe` instead.
@@ -1168,7 +1453,13 @@ def get_symm_buffer_for_mega_moe(
         # perf knobs must not flip it. Explicit knobs dicts already bypassed
         # resolution above and keep full control.
         cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
-    frontend = MegaMoENvfp4Frontend(cfg)
+    profile_configs = None
+    if knob_profiles is not None:
+        profile_configs = tuple(
+            (limit, with_knobs(cfg, profile_knobs))
+            for limit, profile_knobs in knob_profiles
+        )
+    frontend = MegaMoENvfp4Frontend(cfg, profile_configs=profile_configs)
 
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
@@ -69,3 +71,87 @@ def test_backend_relu2_rejects_swiglu_clamp() -> None:
             activation="relu2",
             activation_clamp=10.0,
         )
+
+
+def test_profile_configs_only_change_tactic_fields() -> None:
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+        MegaMoENvfp4Frontend,
+    )
+
+    base = _config(num_tokens_per_rank=64, token_back_mode="reuse_dispatch_warps")
+    small = dataclasses.replace(base, token_back_mode="epi_warps", flag_batch=4)
+    frontend = MegaMoENvfp4Frontend(
+        base,
+        profile_configs=((32, small), (64, base)),
+    )
+    assert tuple(limit for limit, _ in frontend._profile_configs) == (32, 64)
+
+    with pytest.raises(ValueError, match="protocol field"):
+        MegaMoENvfp4Frontend(
+            base,
+            profile_configs=(
+                (32, small),
+                (64, dataclasses.replace(base, num_total_experts=8)),
+            ),
+        )
+    with pytest.raises(ValueError, match="final profile limit"):
+        MegaMoENvfp4Frontend(base, profile_configs=((32, small),))
+
+
+def test_compatible_workspace_layout_reserves_union_slots() -> None:
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.nvfp4 import (
+        _apply_compatible_workspace_layout,
+        _make_compatible_workspace_layout,
+    )
+
+    @dataclasses.dataclass(frozen=True)
+    class Spec:
+        name: str
+        nbytes: int
+        align: int = 16
+        cute_dtype: str = "int32"
+        shape: tuple[int, ...] = (1,)
+
+    class FakeKernel:
+        def __init__(self, local_specs, shared_specs):
+            self._local_region_specs = local_specs
+            self._shared_region_specs = shared_specs
+            self._local_region_by_name = {spec.name: spec for spec in local_specs}
+            self._shared_region_by_name = {spec.name: spec for spec in shared_specs}
+
+    shared = [Spec("shared_counter", 8), Spec("src_token_topk_idx", 64)]
+    small = FakeKernel(
+        [
+            Spec("counter", 8),
+            Spec("l1_token_buffer", 64),
+            Spec("nvlink_barrier_counter", 4),
+        ],
+        shared,
+    )
+    large = FakeKernel(
+        [
+            Spec("counter", 16),
+            Spec("fc2_counter", 4),
+            Spec("l1_token_buffer", 64),
+            Spec("nvlink_barrier_counter", 4),
+            Spec("fc2_output", 128),
+        ],
+        shared,
+    )
+
+    layout = _make_compatible_workspace_layout((small, large))
+    _apply_compatible_workspace_layout(small, layout)
+    _apply_compatible_workspace_layout(large, layout)
+
+    assert small._local_offsets == large._local_offsets
+    assert small._shared_offsets == large._shared_offsets
+    assert layout.local_offsets["l1_token_buffer"] >= 32
+    assert small.local_zero_i32_count == large.local_zero_i32_count
+    assert small._local_total == large._local_total
+
+    incompatible = FakeKernel(
+        large._local_region_specs,
+        [Spec("shared_counter", 16, shape=(2,)), shared[1]],
+    )
+    with pytest.raises(ValueError, match="shared workspace region"):
+        _make_compatible_workspace_layout((small, incompatible))

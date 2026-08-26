@@ -143,6 +143,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+            knob_profiles=k.knob_profiles,
         )
 
     def validate_forward(
@@ -335,6 +336,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         fp = fleet_params
+        profile_key = (
+            None
+            if k.knob_profiles is None
+            else tuple(
+                (limit, knobs_pool_key(profile)) for limit, profile in k.knob_profiles
+            )
+        )
         return (
             "sm100_nvfp4_nvfp4_bf16_cutedsl",
             torch.cuda.current_device(),
@@ -355,6 +363,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             epilogue_pool_key(k.fc2_alpha),
             epilogue_pool_key(k.fc1_norm_const),
             knobs_pool_key(k.knobs),
+            profile_key,
         )
 
     def _forget_workspace_state(self, workspace) -> None:
