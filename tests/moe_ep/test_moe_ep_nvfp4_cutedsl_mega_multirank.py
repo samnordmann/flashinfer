@@ -511,7 +511,11 @@ def _run_mega_layer(
             **tensor_kwargs,
         )
         if check_full_capacity_reference:
-            output_tail = mega._workspace.output_activation[num_tokens:]
+            # Workspace allocation is lazy and collective across EP ranks. Seed
+            # the capacity-only tail before the first launch so the live-row
+            # path cannot pass by restoring data after an earlier forward.
+            workspace = mega._ensure_workspace()
+            output_tail = workspace.output_activation[num_tokens:]
             output_tail.fill_(17.0)
         y_layer = mega.forward(t).clone()
         # Repeated forward on the same session: with no per-launch host reset
