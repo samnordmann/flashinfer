@@ -24,10 +24,10 @@ Single-rank (no torchrun)::
 
     MEGA_NO_DIST=1 python -m flashinfer.moe_ep.tune --dtype nvfp4 ...
 
-``--intermediate`` is the model's post-SwiGLU width (the
-``*MegaMoeConfig.intermediate_size`` convention); the shim-level conversion
-(NVFP4 sessions size fc1 as ``2 * intermediate``) is applied internally, so
-recorded cache keys match engine-time lookups exactly.
+``--intermediate`` is the model's post-activation width (the
+``*MegaMoeConfig.intermediate_size`` convention). NVFP4 SwiGLU sessions size
+FC1 as ``2 * intermediate``; ReLU2 sessions use one projection and therefore
+size FC1 as ``intermediate``. Recorded cache keys match engine-time lookups.
 
 Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
 default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
@@ -49,12 +49,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
     )
+    parser.add_argument("--activation", choices=("swiglu", "relu2"), default="swiglu")
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
         "--intermediate",
         type=int,
         required=True,
-        help="model post-SwiGLU intermediate size "
+        help="model post-activation intermediate size "
         "(*MegaMoeConfig.intermediate_size convention)",
     )
     parser.add_argument("--num-experts", type=int, required=True)
@@ -131,16 +132,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
         return 2
+    if args.activation != "swiglu" and args.dtype != "nvfp4":
+        print("--activation relu2 is only wired for --dtype nvfp4", file=sys.stderr)
+        return 2
+    if args.activation == "relu2" and args.gate_up_clamp is not None:
+        print("--gate-up-clamp is not valid with --activation relu2", file=sys.stderr)
+        return 2
 
     if args.dtype == "nvfp4":
         from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-            run_tuning,
+            run_tuning as run_nvfp4_tuning,
         )
+
+        return run_nvfp4_tuning(args)
     else:
         from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
-            run_tuning,
+            run_tuning as run_mxfp8_tuning,
         )
-    return run_tuning(args)
+
+        return run_mxfp8_tuning(args)
 
 
 if __name__ == "__main__":
