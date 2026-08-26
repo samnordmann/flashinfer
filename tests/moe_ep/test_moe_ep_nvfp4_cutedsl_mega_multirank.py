@@ -401,6 +401,7 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
+    check_full_capacity_reference: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -516,6 +517,38 @@ def _run_mega_layer(
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
 
+        if check_full_capacity_reference:
+            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+                MegaMoENvfp4Inputs,
+            )
+
+            workspace = mega._workspace
+            transformed = mega._transformed
+            frontend = workspace._frontend
+            full_inputs = MegaMoENvfp4Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed[0][0],
+                fc1_weight_sf=transformed[0][1],
+                fc2_weight=transformed[1][0],
+                fc2_weight_sf=transformed[1][1],
+                fc1_alpha=workspace.fc1_alpha,
+                fc2_alpha=workspace.fc2_alpha,
+                fc1_norm_const=workspace.fc1_norm_const,
+                output_activation=workspace.output_activation,
+            )
+            # All ranks execute the legacy capacity-sized traversal together.
+            # stage_inputs already masked [num_tokens:max_tokens], so this is a
+            # bit-exact reference for the runtime live-row bound.
+            dist.barrier()
+            frontend.make_launch_thunk(full_inputs)()
+            torch.cuda.synchronize()
+            dist.barrier()
+            y_full_capacity = workspace.output_activation[:num_tokens].clone()
+            torch.testing.assert_close(y_layer, y_full_capacity, atol=0.0, rtol=0.0)
+
         if check_output_view:
             assert mega.supports_output_view
             y_view = mega.forward(t, return_workspace_view=True)
@@ -596,6 +629,29 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     rank = _run_mega_layer(rank, world_size, quantize_input=True)
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_asymmetric_live_tokens():
+    """Rank-local live bounds preserve fixed peer layouts and exact output."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+
+    num_tokens = 8 * (rank + 1)
+    completed_rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=num_tokens,
+        max_tokens=64,
+        check_full_capacity_reference=True,
+    )
+    print(
+        f"rank {completed_rank}: {num_tokens} live rows match the fixed-capacity reference"
     )
 
 

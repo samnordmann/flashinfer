@@ -1122,6 +1122,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # Runtime host payload; packed into ``SymBuffer{world_size}``
         # before entering the device kernel.
         peer_rank_ptr_mapper_host,
+        # Runtime live-row bound. Input/output tensors retain their fixed
+        # symmetric-buffer capacity so peer strides do not depend on rank-local
+        # batch size.
+        active_num_tokens: cutlass.Int32,
         # Codegen / runtime.
         max_active_clusters: cutlass.Constexpr,
         stream,
@@ -1444,6 +1448,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             token_padding_block=self.token_padding_block,
             sf_padding_block=self.sf_padding_block,
             sm_count=sm_count,
+            active_num_tokens=active_num_tokens,
         )
 
         # C1 / C2 are tautological (token_padding_block == "block_m";

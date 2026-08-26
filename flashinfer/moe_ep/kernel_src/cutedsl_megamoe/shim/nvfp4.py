@@ -301,6 +301,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
+        preserve_capacity: bool = False,
         sync: bool = True,
         reset_counters: bool = False,
         reduce_topk: bool = True,
@@ -309,6 +310,9 @@ class MegaMoENvfp4Frontend:
 
         ``num_tokens`` limits the active token rows when the input buffers are
         sized for ``config.num_tokens_per_rank`` but fewer tokens are live.
+        ``preserve_capacity=True`` retains the full tensor layouts and passes
+        that count as a runtime dispatch bound. This is required when peer
+        ranks have different live counts but share fixed symmetric strides.
 
         The kernel drop reduces the top-k combine internally, so the result is
         always the reduced ``output_activation`` (the old form-A + separate
@@ -326,19 +330,27 @@ class MegaMoENvfp4Frontend:
         run only when the launch cache misses.
         """
         resolved = self._resolve_num_tokens(inputs, num_tokens)
-        if resolved == 0:
+        if resolved == 0 and not preserve_capacity:
             return None
-        key = self._launch_cache_key(inputs, resolved)
+        key = self._launch_cache_key(inputs, resolved, preserve_capacity)
         mega = self._mega
         if mega is None or mega.compiled is None or mega.launch_key != key:
             # Slow path: full validation + (re)compile + launch-kwargs build.
             # Any config change (apply_knobs / set_gate_up_clamp) nulls
             # self._mega, so a live cache entry always matches the config.
-            launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
+            launch_inputs = self._prepare_launch_inputs(
+                inputs,
+                num_tokens=num_tokens,
+                preserve_capacity=preserve_capacity,
+            )
             if launch_inputs is None:
                 return None
             mega = self._ensure_mega_compiled(inputs)
-            mega.launch_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+            mega.launch_kwargs = self._build_mega_runtime_kwargs(
+                launch_inputs,
+                mega,
+                active_num_tokens=resolved,
+            )
             mega.launch_key = key
             mega.launch_output = launch_inputs.output_activation
 
@@ -365,6 +377,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
+        preserve_capacity: bool = False,
     ) -> Callable[[], None]:
         """Zero-arg launcher with args prebuilt (compiles if needed).
 
@@ -375,15 +388,27 @@ class MegaMoENvfp4Frontend:
         ``inputs.output_activation``.  Invalid after the compile cache is
         invalidated (knobs/clamp change) or the buffers are freed.
 
+        ``preserve_capacity=True`` keeps symmetric peer strides fixed while
+        dispatch only traverses ``num_tokens`` live rows.
+
         With ``in_kernel_fc2_reduce`` the thunk is two stream-ordered nodes --
         ``output_activation.zero_()`` then the kernel launch (accumulate-from-
         zero contract of the REDG target); both are CUDA-graph capturable.
         """
-        launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
+        resolved = self._resolve_num_tokens(inputs, num_tokens)
+        launch_inputs = self._prepare_launch_inputs(
+            inputs,
+            num_tokens=num_tokens,
+            preserve_capacity=preserve_capacity,
+        )
         if launch_inputs is None:
             return lambda: None
         mega = self._ensure_mega_compiled(inputs)
-        runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
+        runtime_kwargs = self._build_mega_runtime_kwargs(
+            launch_inputs,
+            mega,
+            active_num_tokens=resolved,
+        )
         compiled = mega.compiled
 
         if self.config.fc2_reduces_topk:
@@ -401,7 +426,11 @@ class MegaMoENvfp4Frontend:
         return thunk
 
     @staticmethod
-    def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:
+    def _launch_cache_key(
+        inputs: MegaMoENvfp4Inputs,
+        num_tokens: int,
+        preserve_capacity: bool,
+    ) -> tuple:
         # Keyed on the RAW (pre-slice) input pointers + the resolved token
         # count: _slice_inputs slices from row 0, so the sliced views keep
         # these data_ptrs and the count captures the shape.
@@ -420,6 +449,7 @@ class MegaMoENvfp4Frontend:
             t.fc1_norm_const.data_ptr(),
             t.output_activation.data_ptr(),
             num_tokens,
+            preserve_capacity,
             torch.cuda.current_stream().cuda_stream,
         )
 
@@ -587,12 +617,15 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int],
+        preserve_capacity: bool = False,
     ) -> Optional[MegaMoENvfp4Inputs]:
         resolved = self._resolve_num_tokens(inputs, num_tokens)
-        if resolved == 0:
+        if resolved == 0 and not preserve_capacity:
             return None
         self._validate_inputs(inputs, num_tokens=resolved)
         buf_tokens = inputs.activation.shape[0]
+        if preserve_capacity:
+            return inputs
         if not self.config.fc2_reduces_topk and resolved < buf_tokens:
             raise ValueError(
                 "Partial num_tokens is not supported when in_kernel_fc2_reduce=False "
@@ -812,6 +845,8 @@ class MegaMoENvfp4Frontend:
         self,
         inputs: MegaMoENvfp4Inputs,
         mega: _CompiledMega,
+        *,
+        active_num_tokens: Optional[int] = None,
     ) -> dict:
         import cuda.bindings.driver as cuda
         from src.sym_buffer import SymBufferHost
@@ -859,6 +894,11 @@ class MegaMoENvfp4Frontend:
             local_workspace=self._to_cute_ptr(mega.local_workspace),
             shared_workspace=self._to_cute_ptr(mega.shared_workspace),
             peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
+            active_num_tokens=(
+                inputs.activation.shape[0]
+                if active_num_tokens is None
+                else active_num_tokens
+            ),
             stream=stream,
         )
 
@@ -1301,9 +1341,14 @@ def nvfp4_mega_moe(
 
     # The kernel reduces the top-k combine internally and writes the final 2D
     # (T, hidden) output; no host-side form-A reduction is needed.  Launch the
-    # full padded buffer (topk_idx[n:] == -1 marks the pad rows) and copy the
-    # live [:n] rows out -- matches the reference driver, which does not slice.
-    out = symm_buffer._frontend.run(inputs, num_tokens=None, sync=False)
+    # fixed-capacity buffer layout so every rank uses identical peer strides,
+    # but bound dispatch traversal to the live [:n] rows.
+    out = symm_buffer._frontend.run(
+        inputs,
+        num_tokens=n,
+        preserve_capacity=True,
+        sync=False,
+    )
     if y is None:
         # Zero-copy: the caller consumes the workspace view under stream
         # ordering (valid until the next launch on this session's buffers).
@@ -1321,6 +1366,8 @@ def nvfp4_mega_launch_thunk(
     transformed_l1: TransformedWeights,
     transformed_l2: TransformedWeights,
     symm_buffer: MegaMoESymmBuffer,
+    *,
+    num_tokens: Optional[int] = None,
 ) -> Callable[[], None]:
     """Prebuilt zero-arg NVFP4 mega launcher for steady-state timing loops.
 
@@ -1328,8 +1375,9 @@ def nvfp4_mega_launch_thunk(
     thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
     Python, no workspace reset (the kernel tail-cleans), no sync, no output
     copy.  The reduced bf16 output lands in ``symm_buffer.output_activation``.
-    Compiles on this call if needed.  Rebuild the thunk after knob/clamp
-    changes or buffer destruction.
+    Compiles on this call if needed. ``num_tokens`` selects the live dispatch
+    bound while retaining fixed-capacity peer layouts. Rebuild the thunk after
+    a token-count, knob, or clamp change, or after buffer destruction.
     """
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")
@@ -1349,7 +1397,11 @@ def nvfp4_mega_launch_thunk(
         fc1_norm_const=symm_buffer.fc1_norm_const,
         output_activation=symm_buffer.output_activation,
     )
-    return symm_buffer._frontend.make_launch_thunk(inputs)
+    return symm_buffer._frontend.make_launch_thunk(
+        inputs,
+        num_tokens=num_tokens,
+        preserve_capacity=num_tokens is not None,
+    )
 
 
 def make_dummy_epilogue_params(

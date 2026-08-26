@@ -223,6 +223,7 @@ _MLIR_VALUE_FIELDS = (
     "shared_zero_prefix",
     "peer_rank_ptr_mapper",
     "local_rank",
+    "active_num_tokens",
 )
 
 _CONST_FIELDS = (
@@ -279,6 +280,7 @@ class TokenCommArgs:
         token_back_schedule_counter: cute.Pointer = None,
         combine_sf: cute.Tensor = None,
         fc2_output_sf: cute.Tensor = None,
+        active_num_tokens: Int32 = None,
     ):
         self.input_token_buffer = input_token_buffer
         self.input_sf_buffer = input_sf_buffer
@@ -315,6 +317,7 @@ class TokenCommArgs:
         self.token_padding_block = token_padding_block
         self.sf_padding_block = sf_padding_block
         self.sm_count = sm_count
+        self.active_num_tokens = active_num_tokens
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -700,7 +703,13 @@ class TokenInPullTokenBackPush:
                         scope="cta",
                     )
                     token_topk_word = Int32(token_global * self.num_topk + topk_slot)
-                    MAX_SLOT_C: cutlass.Constexpr[int] = num_tokens * self.num_topk
+                    # Peer slot strides must remain identical on every rank even
+                    # when their live token counts differ.  The backing top-k
+                    # tensor retains the fixed symmetric-buffer capacity while
+                    # ``num_tokens`` only bounds this rank's dispatch traversal.
+                    MAX_SLOT_C: cutlass.Constexpr[int] = (
+                        topk_idx.shape[0] * self.num_topk
+                    )
                     elem_off = (
                         (local_expert * Int32(self.world_size) + Int32(local_rank))
                         * Int32(MAX_SLOT_C)
@@ -1576,6 +1585,10 @@ class TokenInPullTokenBackPush:
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
+        active_num_tokens = token_comm_args.active_num_tokens
+        if cutlass.const_expr(active_num_tokens is None):
+            active_num_tokens = token_comm_args.input_token_buffer.shape[0]
+
         self.dispatch_prep(
             token_comm_storage,
             token_comm_args.topk_idx,
@@ -1586,7 +1599,7 @@ class TokenInPullTokenBackPush:
             local_warp_idx,
             lane_idx,
             local_rank=token_comm_args.local_rank,
-            num_tokens=token_comm_args.input_token_buffer.shape[0],
+            num_tokens=active_num_tokens,
             num_sms=token_comm_args.sm_count,
         )
 
