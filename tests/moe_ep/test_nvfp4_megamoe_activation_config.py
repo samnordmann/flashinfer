@@ -86,6 +86,13 @@ def test_profile_configs_only_change_tactic_fields() -> None:
     )
     assert tuple(limit for limit, _ in frontend._profile_configs) == (32, 64)
 
+    small_compiled = object()
+    large_compiled = object()
+    frontend._profile_megas = ((32, small_compiled), (64, large_compiled))
+    assert frontend._select_compiled_profile(32) is small_compiled
+    assert frontend._select_compiled_profile(33) is large_compiled
+    assert frontend._select_compiled_profile(65) is None
+
     with pytest.raises(ValueError, match="protocol field"):
         MegaMoENvfp4Frontend(
             base,
