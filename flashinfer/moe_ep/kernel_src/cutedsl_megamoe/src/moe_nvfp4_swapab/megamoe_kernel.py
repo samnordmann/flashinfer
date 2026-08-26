@@ -1518,6 +1518,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 output_activation,
                 score,
                 stream,
+                active_num_tokens,
             )
 
     # =========================================================================

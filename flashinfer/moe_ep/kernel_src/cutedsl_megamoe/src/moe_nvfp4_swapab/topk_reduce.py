@@ -270,10 +270,14 @@ class TopkReduce:
         reduced_output: cute.Tensor,  # (token, hidden)
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
+        active_num_tokens: Int32 = None,
     ):
         threads = self._threads
-        total_workers = reduced_output.shape[0] * self.hidden_tiles
-        grid = [(total_workers + threads - 1) // threads, 1, 1]
+        has_runtime_bound = active_num_tokens is not None
+        if cutlass.const_expr(not has_runtime_bound):
+            active_num_tokens = Int32(reduced_output.shape[0])
+        total_workers = active_num_tokens * self.hidden_tiles
+        grid = [cute.max(cute.ceil_div(total_workers, threads), Int32(1)), 1, 1]
         block = [threads, 1, 1]
 
         combine_quant = cute.make_tensor(
@@ -298,7 +302,13 @@ class TopkReduce:
             )
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
-            self._reduce_bf16(combine_quant, topk_score, reduced_output).launch(
+            self._reduce_bf16(
+                combine_quant,
+                topk_score,
+                reduced_output,
+                active_num_tokens,
+                has_runtime_bound,
+            ).launch(
                 grid=grid,
                 block=block,
                 stream=stream,
@@ -341,13 +351,27 @@ class TopkReduce:
         if cutlass.const_expr(
             self.combine_format.act_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)
         ):
-            self._reduce_mxfp8(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_mxfp8(
+                combine_quant,
+                sf,
+                topk_score,
+                reduced_output,
+                active_num_tokens,
+                has_runtime_bound,
+            ).launch(
                 grid=grid,
                 block=block,
                 stream=stream,
             )
         else:
-            self._reduce_fp4(combine_quant, sf, topk_score, reduced_output).launch(
+            self._reduce_fp4(
+                combine_quant,
+                sf,
+                topk_score,
+                reduced_output,
+                active_num_tokens,
+                has_runtime_bound,
+            ).launch(
                 grid=grid,
                 block=block,
                 stream=stream,
@@ -369,12 +393,14 @@ class TopkReduce:
         combine_output: cute.Tensor,
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        active_num_tokens: Int32,
+        has_runtime_bound: cutlass.Constexpr[bool],
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
-        needs_guard = self.require_predicate
+        needs_guard = self.require_predicate or has_runtime_bound
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
@@ -384,7 +410,7 @@ class TopkReduce:
         token_idx = worker_idx // hidden_tiles
         hidden_tile_idx = worker_idx % hidden_tiles
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        if (not needs_guard) or token_idx < active_num_tokens:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             terms = cute.zipped_divide(
                 combine_output[token_idx, None, None],
@@ -472,12 +498,14 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) e8m0
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        active_num_tokens: Int32,
+        has_runtime_bound: cutlass.Constexpr[bool],
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
-        needs_guard = self.require_predicate
+        needs_guard = self.require_predicate or has_runtime_bound
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
@@ -495,7 +523,7 @@ class TopkReduce:
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
         scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.Float8E8M0FNU)
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        if (not needs_guard) or token_idx < active_num_tokens:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             codes = cute.zipped_divide(
                 combine_quant[token_idx, None, None],
@@ -583,12 +611,14 @@ class TopkReduce:
         combine_sf: cute.Tensor,  # depth-2 broadcast view: logical (token, topk, hidden) bf16 amax
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
+        active_num_tokens: Int32,
+        has_runtime_bound: cutlass.Constexpr[bool],
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
         hidden_tiles = self.hidden_tiles
         num_topk: cutlass.Constexpr[int] = self.num_topk
-        needs_guard = self.require_predicate
+        needs_guard = self.require_predicate or has_runtime_bound
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
 
@@ -606,7 +636,7 @@ class TopkReduce:
         score_reg = cute.make_rmem_tensor((num_topk,), score_dtype)
         scale_reg = cute.make_rmem_tensor((num_topk,), cutlass.BFloat16)
 
-        if (not needs_guard) or token_idx < reduced_output.shape[0]:
+        if (not needs_guard) or token_idx < active_num_tokens:
             # (token, topk, hidden) -> (topk, hidden_per_thread)
             codes = cute.zipped_divide(
                 combine_quant[token_idx, None, None],

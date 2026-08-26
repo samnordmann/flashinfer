@@ -510,6 +510,9 @@ def _run_mega_layer(
             scales=t_scales,
             **tensor_kwargs,
         )
+        if check_full_capacity_reference:
+            output_tail = mega._workspace.output_activation[num_tokens:]
+            output_tail.fill_(17.0)
         y_layer = mega.forward(t).clone()
         # Repeated forward on the same session: with no per-launch host reset
         # (run() default reset_counters=False) the second launch relies on the
@@ -522,6 +525,9 @@ def _run_mega_layer(
                 MegaMoENvfp4Inputs,
             )
 
+            assert torch.all(output_tail == 17.0), (
+                "live-row launch modified the capacity-only output tail"
+            )
             workspace = mega._workspace
             transformed = mega._transformed
             frontend = workspace._frontend
