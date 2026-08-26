@@ -180,6 +180,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 norm_const=self._kernel_config.input_norm_const,
+                mask_tail=False,
             )
         else:
             # Backend talks only to the cutedsl_megamoe shim (never src/ directly).
@@ -205,9 +206,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 ].zero_()
             workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
             workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
-            capacity = workspace.x.shape[0]
-            if num_tokens < capacity:
-                workspace.topk_idx[num_tokens:capacity].fill_(-1)
             from ......kernel_src.cutedsl_megamoe import note_staged_tokens
 
             note_staged_tokens(workspace.topk_idx, num_tokens)

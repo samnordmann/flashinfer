@@ -78,7 +78,16 @@ def _make_batch(num_tokens: int, hidden: int, topk: int, num_experts: int, seed:
     return hidden_states, topk_ids.to(torch.int64), topk_weights.to(torch.float32)
 
 
-def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const):
+def _stage(
+    quant_type: str,
+    monkeypatch,
+    fused: bool,
+    batch,
+    buffers,
+    norm_const,
+    *,
+    mask_tail: bool = True,
+):
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1" if fused else "0")
     hidden_states, topk_ids, topk_weights = batch
     x, sf, idx_out, w_out = buffers
@@ -96,6 +105,7 @@ def _stage(quant_type: str, monkeypatch, fused: bool, batch, buffers, norm_const
             idx_out,
             w_out,
             norm_const=norm_const,
+            mask_tail=mask_tail,
         )
     else:
         from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.staging import (
@@ -165,6 +175,35 @@ def test_fused_stage_launch_cache_tracks_new_data_and_token_count(monkeypatch):
             f"x mismatch at seed={seed} tokens={num_tokens}"
         )
         assert torch.equal(ref[2], buffers[2])
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("fused", [False, True])
+def test_nvfp4_stage_can_preserve_capacity_tail(monkeypatch, fused):
+    """A live-count consumer can skip the capacity-sized routing fill."""
+    import torch
+
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import staged_tokens
+
+    _require_blackwell()
+
+    hidden, topk, num_experts, capacity, num_tokens = 2048, 4, 16, 64, 32
+    buffers = _make_buffers("nvfp4", capacity, hidden, topk)
+    batch = _make_batch(num_tokens, hidden, topk, num_experts, seed=19)
+    _stage(
+        "nvfp4",
+        monkeypatch,
+        fused,
+        batch,
+        buffers,
+        1.0,
+        mask_tail=False,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(buffers[2][:num_tokens], batch[1])
+    assert (buffers[2][num_tokens:] == 7).all()
+    assert staged_tokens(buffers[2]) == num_tokens
 
 
 @pytest.mark.arch_blackwell

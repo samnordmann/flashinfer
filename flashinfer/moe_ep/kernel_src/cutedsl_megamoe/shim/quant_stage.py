@@ -44,8 +44,8 @@ class _CompiledStager:
 # launch-args cache, not a pure function value.
 _STAGERS: dict[tuple, _CompiledStager] = {}
 
-# topk_idx_out.data_ptr() -> num_tokens staged by the last fused call into
-# that buffer (tail-fill memoization; see the fill logic below).
+# topk_idx_out.data_ptr() -> num_tokens staged by the last call into that
+# buffer. Used both for tail-fill memoization and output-view sizing.
 _LAST_STAGED_N: dict[int, int] = {}
 
 # Buffers that have ever been staged inside a CUDA graph capture: replays
@@ -62,12 +62,11 @@ def _to_cute(tensor: torch.Tensor, assumed_align: int = 16):
 
 
 def note_staged_tokens(topk_idx_out: torch.Tensor, num_tokens: int) -> None:
-    """Record a non-fused staging into ``topk_idx_out`` (tail-fill memo).
+    """Record a non-fused staging into ``topk_idx_out``.
 
-    The torch fallback paths stage live rows and re-mask the full tail; they
-    must update the memo so a later fused call cannot skip a fill over rows
-    the fallback left live. Unknown buffers default to "assume fully live"
-    (prev_n = capacity), which is always safe.
+    Callers that leave the tail unmasked must pair this count with an explicit
+    live-row kernel bound. Unknown buffers default to "assume fully live" when
+    a later tail-sensitive fused call decides which rows to clear.
     """
     _LAST_STAGED_N[topk_idx_out.data_ptr()] = num_tokens
 
@@ -119,14 +118,17 @@ def fused_quant_stage(
     *,
     quant_type: str,
     norm_const: Optional[float] = None,
+    mask_tail: bool = True,
 ) -> None:
     """Quantize + stage one batch into the mega symm-buffer views.
 
     ``hidden_states`` is the live ``(n, hidden)`` bf16 batch; the ``*_out``
     tensors are the full-capacity buffer views (``x``/``x_sf``/``topk_idx``/
     ``topk_weights`` of a mega symm buffer, or plain CUDA tensors with the
-    same dtypes). Rows ``[:n]`` are staged and the ``topk_idx`` capacity tail
-    is re-masked to ``-1``, matching the torch staging path's contract.
+    same dtypes). Rows ``[:n]`` are staged. By default the ``topk_idx``
+    capacity tail is re-masked to ``-1``. A caller whose kernel has an explicit
+    live-row bound may set ``mask_tail=False`` and avoid that capacity-sized
+    operation while still updating the staged-token memo.
 
     ``norm_const`` is the NVFP4 offline per-tensor scale (required for
     ``quant_type="nvfp4"``, rejected otherwise).
@@ -150,7 +152,12 @@ def fused_quant_stage(
         # previous batch left routed must be re-masked and the live-count memo
         # must record 0, or staged_tokens()/compute(output=None) would keep
         # reporting the previous batch.
-        _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+        _finish_staging(
+            topk_idx_out,
+            num_tokens,
+            capacity,
+            mask_tail=mask_tail,
+        )
         return
     sf_vec = 16 if is_nvfp4 else 32
     # hidden // sf_vec must be a multiple of 4 so the buffer's round-up-to-4
@@ -224,7 +231,31 @@ def fused_quant_stage(
 
     stager.compiled(*stager.launch_args, **stager.launch_kwargs)
 
-    _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+    _finish_staging(
+        topk_idx_out,
+        num_tokens,
+        capacity,
+        mask_tail=mask_tail,
+    )
+
+
+def _finish_staging(
+    topk_idx_out: torch.Tensor,
+    num_tokens: int,
+    capacity: int,
+    *,
+    mask_tail: bool,
+) -> None:
+    if mask_tail:
+        _mask_tail_and_note(topk_idx_out, num_tokens, capacity)
+        return
+
+    ptr = topk_idx_out.data_ptr()
+    if torch.cuda.is_current_stream_capturing():
+        # Preserve conservative behavior if a later tail-sensitive caller
+        # reuses this buffer after graph replays that bypass host memo updates.
+        _GRAPH_CAPTURED_BUFFERS.add(ptr)
+    _LAST_STAGED_N[ptr] = num_tokens
 
 
 def _mask_tail_and_note(

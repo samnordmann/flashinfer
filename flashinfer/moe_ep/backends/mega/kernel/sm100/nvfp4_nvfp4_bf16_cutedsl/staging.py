@@ -24,12 +24,14 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     norm_const: float = 1.0,
+    mask_tail: bool = True,
 ) -> None:
     """bf16 ``hidden_states`` → NVFP4 activation + fp8 block scales.
 
     Default path is the fused single-launch ``DataPreprocess`` staging kernel
     (quant + routing repack in one launch); ``FLASHINFER_MEGA_FUSED_STAGE=0``
-    falls back to the original torch-composed staging below.
+    falls back to the original torch-composed staging below. ``mask_tail`` may
+    be disabled only when the consuming kernel has an explicit live-row bound.
     """
     # Backend talks only to the cutedsl_megamoe shim (never src/ directly); the
     # package import also bootstraps sys.path for the kernel packages.
@@ -45,10 +47,10 @@ def stage_mega_moe_inputs(
 
     num_tokens, hidden = hidden_states.shape
     if num_tokens == 0:
-        # A zero-token step still owns the buffer: rows a previous batch left
-        # routed must be re-masked (and the live-count memo set to 0) or they
-        # would dispatch as stale live tokens.
-        topk_idx_out.fill_(-1)
+        # Tail-sensitive callers must hide stale rows. The bounded MegaMoE
+        # backend can leave them untouched because it dispatches zero rows.
+        if mask_tail:
+            topk_idx_out.fill_(-1)
         note_staged_tokens(topk_idx_out, 0)
         return
     if hidden % 64 != 0:
@@ -69,6 +71,7 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="nvfp4",
             norm_const=norm_const,
+            mask_tail=mask_tail,
         )
         return
 
@@ -90,7 +93,7 @@ def stage_mega_moe_inputs(
     topk_weights_out[:num_tokens].copy_(topk_weights)
 
     capacity = x_nvfp4.shape[0]
-    if num_tokens < capacity:
+    if mask_tail and num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
     note_staged_tokens(topk_idx_out, num_tokens)
 

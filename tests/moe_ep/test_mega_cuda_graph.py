@@ -312,10 +312,10 @@ def test_mega_layer_forward_output_view_public_api(monkeypatch):
 def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
     """Engine pattern: one graph per batch size + eager calls, interleaved.
 
-    Regression test for the tail-mask memo bug: a small-size graph replayed
-    after a larger one (or an eager call after replays) must not leave the
-    larger batch's rows live in the shared workspace — stale live rows
-    dispatch garbage work and can change outputs.
+    A small-size graph replayed after a larger one (or an eager call after
+    replays) must not dispatch stale rows from the larger batch. The NVFP4
+    backend now enforces this with the graph's runtime live-row bound rather
+    than a capacity-sized tail fill.
     """
     import torch
 
@@ -339,8 +339,8 @@ def test_mega_layer_multi_size_graphs_and_eager_interleave(monkeypatch):
         with torch.cuda.graph(g32):
             y32_g = layer.forward(t32, return_workspace_view=True)
 
-        # Small replay AFTER large replay: the 64-row staging must not leak
-        # into the 32-row step.
+        # Small replay AFTER large replay: stale rows must remain outside the
+        # 32-row dispatch bound.
         g64.replay()
         g32.replay()
         torch.cuda.synchronize()
