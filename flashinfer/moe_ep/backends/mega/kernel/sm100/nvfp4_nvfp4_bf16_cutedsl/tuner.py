@@ -26,6 +26,10 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
     if live_tokens > max_tokens:
         raise SystemExit("--live-tokens must be <= --max-tokens")
+    physical_intermediate = args.intermediate * (
+        2 if args.activation == "swiglu" else 1
+    )
+    cache_dtype = "nvfp4" if args.activation == "swiglu" else "nvfp4_relu2"
     symm_buffer: Any = None
     try:
         y, l1, l2, symm_buffer = create_dummy_nvfp4_inputs(
@@ -36,7 +40,8 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             live_tokens,
             args.topk,
             args.hidden,
-            2 * args.intermediate,
+            physical_intermediate,
+            activation=args.activation,
             gate_up_clamp=args.gate_up_clamp,
             combine_dtype=args.combine_dtype,
             seed=args.seed,
@@ -56,10 +61,10 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                 }
             else:
                 base, src = resolve_knobs(
-                    dtype=args.dtype,
+                    dtype=cache_dtype,
                     world_size=world_size,
                     hidden=args.hidden,
-                    intermediate=2 * args.intermediate,
+                    intermediate=physical_intermediate,
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
