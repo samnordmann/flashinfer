@@ -360,10 +360,10 @@ class MegaMoENvfp4Frontend:
         if self.config.fc2_reduces_topk:
             # ikr accumulate-from-zero contract: output_activation is the
             # cross-rank REDG atomic-add target, so it must be zeroed before
-            # every launch (stream-ordered; ~10 us at 2048 tokens).  Zero the
-            # full raw buffer so stale rows beyond a partial num_tokens can't
-            # leak from an earlier, larger launch.
-            inputs.output_activation.zero_()
+            # every launch. The kernel's explicit live-row bound prevents any
+            # access to stale capacity rows, so only the destination slice that
+            # can receive reductions needs to be cleared.
+            inputs.output_activation[:resolved].zero_()
         mega.compiled(**mega.launch_kwargs)
 
         # Zero-break capture gate: a device synchronize would abort stream
@@ -412,7 +412,7 @@ class MegaMoENvfp4Frontend:
         compiled = mega.compiled
 
         if self.config.fc2_reduces_topk:
-            output_activation = inputs.output_activation
+            output_activation = inputs.output_activation[:resolved]
 
             def thunk() -> None:
                 output_activation.zero_()

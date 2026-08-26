@@ -402,6 +402,7 @@ def _run_mega_layer(
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
     check_full_capacity_reference: bool = False,
+    check_capacity_output_tail: bool = False,
 ):
     import torch
     import torch.distributed as dist
@@ -510,7 +511,7 @@ def _run_mega_layer(
             scales=t_scales,
             **tensor_kwargs,
         )
-        if check_full_capacity_reference:
+        if check_full_capacity_reference or check_capacity_output_tail:
             # Workspace allocation is lazy and collective across EP ranks. Seed
             # the capacity-only tail before the first launch so the live-row
             # path cannot pass by restoring data after an earlier forward.
@@ -523,6 +524,11 @@ def _run_mega_layer(
         # kernel's tail cleanup of its workspace counters/flags -- this is the
         # regression guard for that contract.
         y_layer2 = mega.forward(t)
+
+        if check_capacity_output_tail:
+            assert torch.all(output_tail == 17.0), (
+                "live-row launch modified the capacity-only output tail"
+            )
 
         if check_full_capacity_reference:
             from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
@@ -772,7 +778,13 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_in_kernel_fc2_reduce():
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(
-        rank, world_size, quantize_input=True, in_kernel_fc2_reduce=True
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=32,
+        max_tokens=64,
+        in_kernel_fc2_reduce=True,
+        check_capacity_output_tail=True,
     )
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (in_kernel_fc2_reduce) "
