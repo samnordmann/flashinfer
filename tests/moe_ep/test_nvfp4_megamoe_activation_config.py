@@ -86,6 +86,13 @@ def test_profile_configs_only_change_tactic_fields() -> None:
     )
     assert tuple(limit for limit, _ in frontend._profile_configs) == (32, 64)
 
+    small_compiled = object()
+    large_compiled = object()
+    frontend._profile_megas = ((32, small_compiled), (64, large_compiled))
+    assert frontend._select_compiled_profile(32) is small_compiled
+    assert frontend._select_compiled_profile(33) is large_compiled
+    assert frontend._select_compiled_profile(65) is None
+
     with pytest.raises(ValueError, match="protocol field"):
         MegaMoENvfp4Frontend(
             base,
@@ -155,3 +162,7 @@ def test_compatible_workspace_layout_reserves_union_slots() -> None:
     )
     with pytest.raises(ValueError, match="shared workspace region"):
         _make_compatible_workspace_layout((small, incompatible))
+
+    missing_shared_region = FakeKernel(large._local_region_specs, shared[1:])
+    with pytest.raises(ValueError, match="same region names"):
+        _make_compatible_workspace_layout((small, missing_shared_region))

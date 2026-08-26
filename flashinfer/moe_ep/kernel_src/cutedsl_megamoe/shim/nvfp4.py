@@ -263,7 +263,12 @@ def _make_compatible_workspace_layout(
         specs_by_kernel = [
             getattr(kernel, f"_{kind}_region_by_name") for kernel in kernels
         ]
-        all_names = set().union(*(specs.keys() for specs in specs_by_kernel))
+        region_names = [set(specs) for specs in specs_by_kernel]
+        if kind == "shared" and any(names != region_names[0] for names in region_names):
+            raise ValueError(
+                "shared workspace profiles must expose the same region names"
+            )
+        all_names = region_names[0] if kind == "shared" else set().union(*region_names)
         anchors = [
             kernel
             for kernel, specs in zip(kernels, specs_by_kernel, strict=False)
