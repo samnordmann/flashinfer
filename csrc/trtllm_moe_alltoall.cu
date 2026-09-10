@@ -273,12 +273,12 @@ nvinfer1::DataType toNvDataType(DLDataType dtype) {
   return nvinfer1::DataType::kFLOAT;
 }
 
-void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
-                         TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
-                         int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                         bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
-                         Optional<TensorView> outputScales, double outputScalarScale,
-                         int64_t sfLayout, TensorView output) {
+Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
+                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
+                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
+                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
+                       Optional<TensorView> outputScales, double outputScalarScale,
+                       int64_t sfLayout) {
   using tl_throughput::MoeA2ACombineParams;
   using tl_throughput::MoeA2ACombineQuantMode;
   using tl_throughput::MoeA2ACombineSwizzleSFMode;
@@ -326,15 +326,8 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   auto const output_shape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
                                 ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
                                 : tvm::ffi::Shape{localNumTokens, elementsPerToken};
-  CHECK_INPUT(output);
-  CHECK_DEVICE(payload, output);
-  TVM_FFI_ICHECK_EQ(output.ndim(), 2) << "output must be a 2D tensor";
-  TVM_FFI_ICHECK_EQ(output.size(0), output_shape[0]);
-  TVM_FFI_ICHECK_EQ(output.size(1), output_shape[1]);
-  auto const expectedOutputDtype = outputDtype_.value_or(payload.dtype());
-  TVM_FFI_ICHECK(output.dtype() == expectedOutputDtype)
-      << "output dtype must match " << (outputDtype_.has_value() ? "output_dtype" : "payload dtype")
-      << " (expected " << expectedOutputDtype << ", got " << output.dtype() << ")";
+  Tensor output =
+      alloc_tensor(output_shape, outputDtype_.value_or(payload.dtype()), payload.device());
   params.ep_size = static_cast<int>(epSize);
   params.ep_rank = static_cast<int>(epRank);
   params.local_num_tokens = static_cast<int>(localNumTokens);
@@ -403,26 +396,6 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
   auto err = cudaGetLastError();
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_a2a_combine launch failed: " << cudaGetErrorString(err);
-}
-
-Tensor moeA2ACombineOp(TensorView payload, int64_t localNumTokens, TensorView workspace,
-                       TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
-                       int64_t epSize, int64_t topK, int64_t combinePayloadOffset,
-                       bool payloadInWorkspace, Optional<DLDataType> outputDtype_,
-                       Optional<TensorView> outputScales, double outputScalarScale,
-                       int64_t sfLayout) {
-  CHECK_INPUT(payload);
-  TVM_FFI_ICHECK_EQ(payload.ndim(), 3)
-      << "payload must be [ep_size, runtime_max_tokens_per_rank, hidden]";
-  int64_t const elementsPerToken = payload.size(2);
-  auto const outputShape = outputDtype_.has_value() && outputDtype_.value() == dl_uint8
-                               ? tvm::ffi::Shape{localNumTokens, elementsPerToken / 2}
-                               : tvm::ffi::Shape{localNumTokens, elementsPerToken};
-  Tensor output =
-      alloc_tensor(outputShape, outputDtype_.value_or(payload.dtype()), payload.device());
-  moeA2ACombineIntoOp(payload, localNumTokens, workspace, metainfo, runtimeMaxTokensPerRank, epRank,
-                      epSize, topK, combinePayloadOffset, payloadInWorkspace, outputDtype_,
-                      outputScales, outputScalarScale, sfLayout, output);
   return output;
 }
 
@@ -482,6 +455,5 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_aux_data_size, getMoeA2AAuxDataSize);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_initialize, moeA2AInitializeOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_dispatch, moeA2ADispatchOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine, moeA2ACombineOp);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_combine_into, moeA2ACombineIntoOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_sanitize_expert_ids, moeA2ASanitizeExpertIdsOp);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(moe_a2a_get_metainfo_index_pairs, getMoeA2AMetaInfoIndexPairs);
